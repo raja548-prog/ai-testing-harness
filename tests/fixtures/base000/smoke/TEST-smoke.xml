@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="settlenxt-smoke" tests="5" failures="2">
+  <testcase classname="clearing.Dispute" name="chargebackReversalSettlesNextCycle" id="SNX-001" time="3.500"/>
+  <testcase classname="clearing.Fees" name="interchangeFeeRounding" id="SNX-002" time="0.410">
+    <failure type="AssertionError" message="fee mismatch 0.01">at FeesIT.java:41</failure>
+  </testcase>
+  <testcase classname="settlement.Batch" name="batchCloseWithinWindow" id="SNX-003" time="9.000"/>
+  <testcase classname="settlement.Report" name="netPositionReport" id="SNX-004" time="1.100">
+    <failure type="AssertionError" message="report column order changed">at ReportIT.java:19</failure>
+  </testcase>
+  <testcase classname="clearing.Presentment" name="firstPresentmentAccepted" id="SNX-005" time="0.900"/>
+</testsuite>

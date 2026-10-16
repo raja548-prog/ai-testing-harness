@@ -1,0 +1,58 @@
+# Production-shaped profile for SettleNxt (adapters to be wired to real Jenkins/GitLab).
+apiVersion: ainxt.io/test-profile/v1
+product: settlenxt
+owners: [settlement-dept]   # any member of the owning department
+repos:
+  code:  git@gitlab.internal:settle/settlenxt.git
+  tests: git@gitlab.internal:settle/settlenxt-regression.git
+
+build:            # CI: build and push to Nexus
+  adapter: gitlab-pipeline
+  project: settle/settlenxt
+  artifactRepo: nexus://releases/settlenxt
+deploy:           # CD: pull artifact by commit id
+  adapter: jenkins-job
+  job: settlenxt-cd-uat
+  params: { COMMIT_ID: "${commit}", ENV: uat1 }
+  healthCheck: { url: "https://uat1.internal/settlenxt/health", expect: 200, timeoutSec: 600 }
+
+suites:
+  - id: smoke
+    executor: { adapter: jenkins-job, job: settlenxt-smoke }
+    results:  { format: junit-xml, path: "target/surefire-reports/*.xml" }
+    maxDurationMin: 15
+  - id: regression
+    executor: { adapter: jenkins-job, job: settlenxt-regression }
+    results:  { format: junit-xml, path: "target/failsafe-reports/*.xml" }
+    maxDurationMin: 180
+
+selection:
+  default: [smoke]
+  rules:
+    - when: { pathsChanged: ["**/clearing/**"] }
+      run:  [smoke, regression]
+
+testAuthoring:
+  mode: git-mr
+  framework: testng-cucumber
+  conventions: skills/settlenxt-test-conventions.md
+
+logs:
+  sources:
+    - { adapter: log-api, endpoint: "https://uat-logs.internal/logs", keys: [rrn, stan, batchId] }   # preferred
+    - { adapter: ssh, jumpHost: uat-jump.internal, user: ath-logread, paths: ["/opt/settlenxt/logs/*.log"] }   # fallback
+  masking: [pan, cvv, track2, aadhaar, mobile]
+
+policy:
+  flakyRetries: 2
+  quarantineList: tests/quarantine.txt
+  maxFixIterations: 3
+  environments: [uat1]    # harness refuses any other target
+  envLock: { adapter: dept-env-booking, env: uat1, waitMaxMin: 120 }
+  knownFailures:
+    - { caseId: SNX-004, ticket: SNX-1790, expires: "2026-12-31" }
+
+models:                   # per stage, configurable; local models preferred
+  default:   local/onprem-coder
+  triage:    local/onprem-reasoner
+  remediate: local/onprem-coder

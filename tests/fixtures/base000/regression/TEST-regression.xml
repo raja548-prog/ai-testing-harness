@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+  <testsuite name="settlenxt-regression" tests="2">
+    <testcase classname="clearing.Recon" name="reconMatchesSwitchTotals" id="SNX-REG-0101" time="22.0"/>
+    <testcase classname="clearing.Recon" name="reconFlagsMismatch" id="SNX-REG-0102" time="18.5"/>
+  </testsuite>
+</testsuites>

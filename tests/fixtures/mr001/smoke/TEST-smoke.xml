@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="settlenxt-smoke" tests="5" failures="4">
+  <testcase classname="clearing.Dispute" name="chargebackReversalSettlesNextCycle" id="SNX-001" time="3.812" tags="clearing,dispute">
+    <failure type="AssertionError" message="expected settlementAmt=1250.00 got 0.00 for card 4111 1111 1111 1111">at ClearingDisputeIT.java:88</failure>
+    <properties><property name="rrn" value="629014773311"/></properties>
+  </testcase>
+  <testcase classname="clearing.Fees" name="interchangeFeeRounding" id="SNX-002" time="0.420">
+    <failure type="AssertionError" message="fee mismatch 0.01">at FeesIT.java:41</failure>
+  </testcase>
+  <testcase classname="settlement.Batch" name="batchCloseWithinWindow" id="SNX-003" time="12.100">
+    <failure type="TimeoutException" message="batch close exceeded 10s">at BatchIT.java:120</failure>
+    <system-out>batchId=B20261016-07</system-out>
+  </testcase>
+  <testcase classname="settlement.Report" name="netPositionReport" id="SNX-004" time="1.200">
+    <failure type="AssertionError" message="report column order changed">at ReportIT.java:19</failure>
+  </testcase>
+  <testcase classname="clearing.Presentment" name="firstPresentmentAccepted" id="SNX-005" time="0.950"/>
+</testsuite>

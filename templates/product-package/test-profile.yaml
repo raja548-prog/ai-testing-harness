@@ -1,0 +1,44 @@
+# Generated at onboarding (Agent Studio). Replace every <placeholder>.
+# Validate with: ainxt-ath doctor test-profile.yaml
+apiVersion: ainxt.io/test-profile/v1
+product: <product-id>
+owners: [<department-group>]
+repos:
+  code:  <git-url-of-code-repo>
+  tests: <git-url-of-test-repo>
+
+build:  { adapter: <gitlab-pipeline|jenkins-job>, project: <ci-project> }
+deploy:
+  adapter: <jenkins-job|gitlab-pipeline>
+  job: <cd-job>
+  params: { COMMIT_ID: "${commit}", ENV: <uat-env> }
+  healthCheck: { url: <health-url>, expect: 200, timeoutSec: 600 }
+
+suites:
+  - id: smoke
+    executor: { adapter: <jenkins-job|test-server-api|simulator>, job: <smoke-job> }
+    results:  { format: <junit-xml|allure-json|cucumber-json|custom>, path: <glob> }
+    maxDurationMin: 15
+
+selection:
+  default: [smoke]
+  rules: []
+
+testAuthoring:
+  mode: <git-mr|test-server-api|simulator-scenarios>
+  conventions: skills/<product>-test-conventions.md
+
+logs:
+  sources:
+    - { adapter: log-api, endpoint: <log-api-url>, keys: [<rrn>, <stan>] }   # preferred
+  masking: [pan, cvv, track2, aadhaar, mobile]
+
+policy:
+  flakyRetries: 2
+  maxFixIterations: 3
+  environments: [<uat-env>]
+  envLock: { adapter: <dept-env-booking>, env: <uat-env>, waitMaxMin: 120 }
+  knownFailures: []
+
+models:
+  default: local/<approved-model>

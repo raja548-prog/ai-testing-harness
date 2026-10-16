@@ -1,0 +1,6 @@
+AiNxt Test Harness (ATH)
+
+The stage-and-skill pipeline structure, configuration profiles, run manifest and
+doctor/estimate conventions are inspired by the Visa Vulnerability Agentic Harness
+(https://github.com/visa/visa-vulnerability-agentic-harness), licensed under Apache 2.0.
+No VVAH source code is included in this repository.
