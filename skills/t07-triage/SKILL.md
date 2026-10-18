@@ -2,7 +2,7 @@
 name: ath-t07-triage
 stage: T7
 model_role: triage
-output_schema: {"category": "code-regression|test-outdated|test-data|environment|unknown", "evidence": "string"}
+output_schema: {"category": "code-regression|test-outdated|test-data|environment|unknown", "quote": "string", "evidence": "string"}
 ---
 
 # T7 failure triage (one of three independent voters)
@@ -26,4 +26,10 @@ Decide one category:
 - `environment`: dependency down, config drift, timeouts unrelated to the change.
 - `unknown`: evidence is insufficient. Prefer this over guessing.
 
-Cite the specific log line, diff hunk or TSD clause that supports your answer in `evidence`.
+Answer with three fields:
+- `category`: one of the categories above.
+- `quote`: one line or fragment, at least 12 characters, copied character for character from a
+  `<data>` block (a log line, a diff line, a TSD clause or the failure message) that supports your
+  category. ATH checks it against the inputs it sent; a vote whose quote is not found is discarded.
+  Copy text, never paraphrase. For `unknown`, use an empty string.
+- `evidence`: one or two sentences on why that quote supports the category.

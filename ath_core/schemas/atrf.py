@@ -43,6 +43,8 @@ class Triage(BaseModel):
     decided_by: str  # "precheck" | "vote" | "human"
     reason: str = ""
     votes: list[str] = Field(default_factory=list)
+    evidence: list[str] = Field(default_factory=list)  # verified quotes from the inputs, one per agreeing vote
+    notes: list[str] = Field(default_factory=list)     # why votes were discarded or came back unknown
 
 
 class ATRFCase(BaseModel):

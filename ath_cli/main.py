@@ -6,12 +6,15 @@ platform, the same commands call the ATH API with the user's SSO token instead.
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 import uuid
 from pathlib import Path
 
 from ath_core.adapters import AdapterError, registry
 from ath_core.adapters import loader  # noqa: F401
+from ath_core.agents.cli import build_triage_agents, diversity_problem, load_skill, model_family, voter_models
+from ath_core.config import load_config
 from ath_core.schemas import RunContext, RunMode, load_profile
 from ath_server.orchestrator import Orchestrator, StateStore
 
@@ -55,19 +58,55 @@ def cmd_doctor(a: argparse.Namespace) -> int:
         print(f"  [{'ok' if not problems else 'CONFIG'}] {where}: {kind} adapter '{name}'")
         for problem in problems:
             print(f"      - {problem}")
+    bad += _doctor_agent_runner(a)
     # TODO (platform): check the user's Git/Jira profile tokens and env reachability.
     print("doctor: all adapters available and configured" if not bad else f"doctor: {bad} adapter(s) missing or misconfigured")
     return 0 if not bad else 2
 
 
+def _doctor_agent_runner(a: argparse.Namespace) -> int:
+    """Report the agent CLI used for LLM stages. Returns 1 if it is configured but unusable."""
+    try:
+        cfg = load_config(a.config)
+    except Exception as e:  # missing file, YAML or validation error
+        print(f"  [CONFIG] agent runner: {e}")
+        return 1
+    rc = cfg.agent_runner
+    if rc is None:
+        print("  [--] agent runner: not configured; LLM triage is off (failures go to human review)")
+        return 0
+    problems = []
+    if shutil.which(rc.command[0]) is None:
+        problems.append(f"command {rc.command[0]!r} not found on PATH")
+    try:
+        load_skill(cfg.skills_dir / "t07-triage" / "SKILL.md")
+    except OSError as e:
+        problems.append(f"triage skill not readable: {e}")
+    models = voter_models(cfg, load_profile(a.profile))
+    if problem := diversity_problem(cfg, models):
+        problems.append(problem)
+    print(f"  [{'ok' if not problems else 'CONFIG'}] agent runner: {rc.command[0]} x{rc.voters} voters "
+          f"(from {cfg.source})")
+    families = [model_family(m, rc.model_families) or "unclassified" for m in models]
+    labels = [f"{m or '(no model)'} ({f})" for m, f in zip(models, families)]
+    print(f"      voters: {', '.join(labels)}")
+    if len(set(families)) == 1 and rc.voters > 1:
+        print("      note: all voters share one model family, so their votes are correlated; "
+              "see minFamilies in examples/ath-config.yaml")
+    for problem in problems:
+        print(f"      - {problem}")
+    return 1 if problems else 0
+
+
 def _orch(a: argparse.Namespace) -> Orchestrator:
     profile = load_profile(a.profile)
+    agents = build_triage_agents(load_config(a.config), profile)
     store = StateStore(a.db)
     quarantined = set()
     if getattr(a, "quarantine", None):
         quarantined = {l.strip() for l in Path(a.quarantine).read_text().splitlines() if l.strip()}
     return Orchestrator(profile, store, package_version=a.package_version, quarantined=quarantined,
-                        report_dir=a.report_dir)
+                        report_dir=a.report_dir, agents=agents)
 
 
 def _print_result(m) -> int:
@@ -79,7 +118,11 @@ def _print_result(m) -> int:
 
 
 def cmd_run(a: argparse.Namespace) -> int:
-    orch = _orch(a)
+    try:
+        orch = _orch(a)
+    except ValueError as e:  # profile or harness config problem, e.g. the model-family rule
+        print(f"refused: {e}")
+        return 1
     ctx = RunContext(
         run_id=a.run_id or f"ath-{uuid.uuid4().hex[:10]}", product=orch.profile.product,
         mode=RunMode(a.mode), mr=a.mr, jira=a.jira, commit=a.commit, merge_base=a.merge_base,
@@ -98,7 +141,12 @@ def cmd_run(a: argparse.Namespace) -> int:
 
 
 def cmd_resume(a: argparse.Namespace) -> int:
-    return _print_result(_orch(a).resume(a.run_id))
+    try:
+        orch = _orch(a)
+    except ValueError as e:
+        print(f"refused: {e}")
+        return 1
+    return _print_result(orch.resume(a.run_id))
 
 
 def cmd_report(a: argparse.Namespace) -> int:
@@ -123,6 +171,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     d = sub.add_parser("doctor", help="validate profile and check adapters")
     d.add_argument("profile")
+    d.add_argument("--config", help="harness config (default: $ATH_CONFIG, .ath/config.yaml, ~/.config/ainxt/ath.yaml)")
     d.set_defaults(fn=cmd_doctor)
 
     def common(p: argparse.ArgumentParser) -> None:
@@ -131,6 +180,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--package-version", default="dev")
         p.add_argument("--report-dir", default=".ath/reports")
         p.add_argument("--quarantine", help="file with one quarantined case id per line")
+        p.add_argument("--config", help="harness config (default: $ATH_CONFIG, .ath/config.yaml, ~/.config/ainxt/ath.yaml)")
 
     r = sub.add_parser("run", help="start a run")
     common(r)

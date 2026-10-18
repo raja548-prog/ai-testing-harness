@@ -1,0 +1,51 @@
+# Harness config: how ATH reaches local tools on this desktop or server. Never put secrets here.
+# Copy to ~/.config/ainxt/ath.yaml (user), .ath/config.yaml (project), or point $ATH_CONFIG at it.
+# Check with: ainxt-ath doctor <profile> --config <this file>
+
+agentRunner:
+  # One headless AiNxt CLI session per LLM stage call (see the ainxt-cli user guide,
+  # 14-headless-mode, 18-sandbox, 22-permissions-and-safety). Placeholders:
+  #   {prompt_file}  file holding the prompt (ainxt does not read the prompt from stdin)
+  #   {prompt}       the prompt as one argument, for -p (visible in `ps`; prefer the file)
+  #   {model}        the profile's model for the stage; must be an `ainxt models` name
+  #   {workdir}      the empty temporary directory the session runs in
+  command:
+    - ainxt                         # or the full path, e.g. ~/.ainxt/bin/ainxt (the installer's default)
+    - --prompt-file
+    - "{prompt_file}"
+    - -m
+    - "{model}"
+    - --cwd
+    - "{workdir}"
+    - --output-format
+    - json                          # one envelope; ATH reads the answer from its "text" field
+    - --sandbox
+    - strict                        # reads limited to the empty workdir and system paths
+    - --max-turns
+    - "2"                           # triage needs no tool loop
+    - --disallowed-tools
+    - run_terminal_cmd,Agent        # no shell, no subagents
+    - --deny
+    - Edit(**)                      # no file edits
+  # Never add --yolo or --permission-mode bypassPermissions: ATH refuses such a command.
+  # Without them, headless ainxt cancels any tool call that would need approval.
+  promptVia: file
+  timeoutSec: 300
+  voters: 3                         # independent T7 triage sessions; 2 of 3 must agree
+  # Voters from one model family make the same mistakes. List models from different families
+  # (names from `ainxt models`), map them to families, then raise minFamilies to 2.
+  # models: [onprem-llama-70b, onprem-qwen-72b, onprem-llama-70b]
+  # modelFamilies: { "onprem-llama*": meta, "onprem-qwen*": qwen, "claude-*": anthropic }
+  minFamilies: 1                    # >1: ATH refuses runs whose voters span fewer families
+  passEnv:                          # forwarded if set; everything else is withheld
+    - AINXT_API_KEY                 # CI/server auth. On a desktop, an existing `ainxt login` is reused:
+                                    # it lives in ~/.ainxt (or $AINXT_HOME) and HOME is always passed.
+    - AINXT_TOKEN
+    - AINXT_API_BASE_URL
+    - AINXT_GATEWAY_URL
+    - AINXT_HOME
+  setEnv:
+    AINXT_MAX_RETRIES: "2"          # default 15 can keep a headless run silent for ~6 minutes
+    AINXT_DISABLE_AUTOUPDATER: "1"
+
+# skillsDir: ../skills              # stage skills; relative to this file. Default: the install's skills/.

@@ -21,7 +21,7 @@ ainxt-ath/
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[server,dev]"
-pytest                                   # 41 tests, no network needed
+pytest                                   # 60 tests, no network needed
 
 ainxt-ath doctor examples/settlenxt/test-profile.local.yaml
 ainxt-ath run --profile examples/settlenxt/test-profile.local.yaml \
@@ -47,7 +47,8 @@ API: `ATH_PROFILES=examples/settlenxt uvicorn ath_server.api.app:app --reload`, 
 | Masking (PAN with Luhn, track 2, CVV, PIN block, Aadhaar, mobile) | Done |
 | Orchestrator: stage plan per mode, checkpoints, resume, gates, env hold, structured events | Done (in-process) |
 | T2 rule-based selection, T4 deploy, T5 run + merge-base baseline cache, T6 normalize | Done |
-| T7 pre-checks (known failure, quarantine, pre-existing, flaky retry), voting + 2-of-3 quorum | Done; agents pluggable |
+| T7 pre-checks (known failure, quarantine, pre-existing, flaky retry), voting + 2-of-3 quorum | Done |
+| T7 triage agents through a headless agent CLI (AiNxt CLI) | Done; tested with a fake CLI |
 | T9 Markdown report | Done; posting to MR/Jira is a TODO |
 | Log sources: log-api (HTTP), ssh (server-only, skeleton), fake | Partly |
 | Jenkins adapter (webhook or API trigger, test-report or artifact results) | Done; tested against a mock Jenkins |
@@ -58,13 +59,50 @@ API: `ATH_PROFILES=examples/settlenxt uvicorn ath_server.api.app:app --reload`, 
 
 1. **Wire real adapters** for the first pilot: GitLab trigger and poll, the department env-booking
    hold (`dept-env-booking`), and the UAT `log-api`.
-2. **Triage agents**: implement `TriageAgent.classify` against the AiNxt model gateway using
-   `skills/t07-triage`, then build `tests/evals/` from real past failures and measure precision
-   before enabling it.
+2. **Triage quality**: confirm the AiNxt CLI's headless flags in `examples/ath-config.yaml`, attach the
+   MR diff, TSD excerpt and product skill to the triage inputs, then build `tests/evals/` from real past
+   failures and measure precision before enabling it.
 3. **Service hardening**: Postgres store, SSO JWT validation and run-scoped tokens, credential
    broker for Git/Jira, and durable workflows (e.g. Temporal) wrapping the stage functions.
 4. **More parsers**: allure-json, testng, cucumber-json, and the simulator CSV format.
 5. **LLM stages**: T1 → T3 (behind its gate) → T10/T11 in `assist` mode.
+
+## Using the AiNxt CLI for LLM stages
+
+ATH runs each LLM stage call as one short-lived, headless session of an agent CLI: the AiNxt CLI on
+a desktop or server, or any grok-cli style tool. Configure it once per machine in a harness config
+(see [`examples/ath-config.yaml`](examples/ath-config.yaml)), found in this order: `--config`,
+`$ATH_CONFIG`, `.ath/config.yaml`, `~/.config/ainxt/ath.yaml`.
+
+```yaml
+agentRunner:
+  command: [ainxt, --prompt-file, "{prompt_file}", -m, "{model}", --cwd, "{workdir}",
+            --output-format, json, --sandbox, strict, --max-turns, "2",
+            --disallowed-tools, "run_terminal_cmd,Agent", --deny, "Edit(**)"]
+  promptVia: file
+  voters: 3
+  passEnv: [AINXT_API_KEY, AINXT_GATEWAY_URL]
+  setEnv: { AINXT_MAX_RETRIES: "2" }
+```
+
+ATH refuses a command containing `--yolo` or `bypassPermissions`: without them, headless `ainxt`
+cancels any tool call that would need approval.
+
+```bash
+ainxt-ath doctor examples/settlenxt/test-profile.yaml --config ~/.config/ainxt/ath.yaml
+ainxt-ath run --profile ... --commit ... --merge-base ... --env uat1     # T7 now votes through the CLI
+```
+
+Each session gets the stage skill plus masked `<data>` blocks, runs in an empty temporary directory
+with only `PATH`, `HOME`, locale, the `passEnv` variables and `setEnv` values, and must answer with
+one JSON object matching the skill's `output_schema` (a CLI JSON envelope such as
+`ainxt --output-format json` is unwrapped first). A crash, timeout or unusable answer counts as an `unknown` vote.
+
+Each vote must also quote, character for character, a line from the data ATH sent (a log line, diff
+line, TSD clause or the failure message). ATH checks the quote; a vote with no quote or an invented one
+is discarded as `unknown`, with a note in the ATRF. Verified quotes appear as evidence in the report.
+Set `minFamilies` with `modelFamilies` to require voters from different model families. Today
+this drives T7 triage; T1, T3, T10 and T11 will use the same runner.
 
 ## Connecting your Jenkins
 

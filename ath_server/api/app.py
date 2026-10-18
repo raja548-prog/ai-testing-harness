@@ -16,6 +16,8 @@ from fastapi import BackgroundTasks, FastAPI, Header, HTTPException
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
+from ath_core.agents.cli import build_triage_agents
+from ath_core.config import load_config
 from ath_core.schemas import RunContext, RunMode, load_profile
 from ath_server.orchestrator import Orchestrator, StateStore
 
@@ -23,6 +25,7 @@ app = FastAPI(title="AiNxt Test Harness API", version="0.1.0")
 os.makedirs(".ath", exist_ok=True)
 STORE = StateStore(os.environ.get("ATH_DB", ".ath/api.db"))
 PROFILE_DIR = Path(os.environ.get("ATH_PROFILES", "examples/settlenxt"))
+CONFIG = load_config()  # server harness config: agent CLI for LLM stages ($ATH_CONFIG)
 
 
 class RunRequest(BaseModel):
@@ -50,7 +53,11 @@ def _orchestrator(product: str, profile_file: str) -> Orchestrator:
     profile = load_profile(path)
     if profile.product != product:
         raise HTTPException(400, "product does not match profile")
-    return Orchestrator(profile, STORE)
+    try:
+        agents = build_triage_agents(CONFIG, profile)
+    except ValueError as e:  # server harness config breaks a rule, e.g. model-family diversity
+        raise HTTPException(500, f"server agent config: {e}")
+    return Orchestrator(profile, STORE, agents=agents)
 
 
 @app.post("/runs", status_code=202)

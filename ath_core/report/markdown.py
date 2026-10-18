@@ -28,6 +28,9 @@ def render_report(ctx: RunContext, runs: list[ATRFRun], notes: list[str] | None 
         for c in group:
             cat = c.triage.category.value if c.triage else "untriaged"
             reason = c.triage.reason if c.triage else ""
+            if c.triage and c.triage.evidence:
+                reason += f'; evidence: "{c.triage.evidence[0][:120]}"'
+            reason = reason.replace("|", "\\|")
             msg = (c.failure.message if c.failure else "").replace("|", "\\|")[:160]
             lines.append(f"| `{c.id}` | {c.suite} | {cat} | {reason} | {msg} |")
     if notes:

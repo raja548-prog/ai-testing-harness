@@ -23,8 +23,15 @@ def test_track2_cvv_pinblock():
 
 def test_aadhaar_and_mobile():
     m = Masker()
-    out = m.mask("aadhaar 2345 6789 0123 mobile +91 9876543210")
+    out = m.mask("aadhaar 2345 6789 0124 mobile +91 9876543210")  # Verhoeff-valid test number
     assert "[AADHAAR]" in out and "[MOBILE]" in out
+
+
+def test_rrn_is_not_mistaken_for_aadhaar():
+    # RRNs are 12 digits too and are the key logs are fetched by; only Verhoeff-valid numbers are Aadhaar.
+    m = Masker()
+    assert m.mask("settlement failed for rrn=629014773311") == "settlement failed for rrn=629014773311"
+    assert m.mask("id 2345 6789 0123") == "id 2345 6789 0123"  # checksum fails: not an Aadhaar number
 
 
 def test_categories_follow_profile():
