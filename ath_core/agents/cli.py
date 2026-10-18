@@ -24,6 +24,7 @@ import yaml
 
 from ath_core.config import AgentRunnerConfig, HarnessConfig
 from ath_core.masking import Masker
+from ath_core.policy import load_policy
 from ath_core.schemas.atrf import ATRFCase, TriageCategory
 from ath_core.schemas.profile import TestProfile
 from ath_core.triage.voting import Vote
@@ -248,7 +249,7 @@ def diversity_problem(cfg: HarnessConfig, models: list[str]) -> str | None:
 def build_triage_agents(cfg: HarnessConfig, profile: TestProfile) -> list[CliTriageAgent]:
     """Voters for T7 from the harness config; none when no agent runner is configured.
 
-    Raises ValueError when the voters do not meet the config's model-family diversity rule.
+    Raises ValueError when the voters break the model-family rule or the model policy.
     """
     rc = cfg.agent_runner
     if rc is None:
@@ -256,7 +257,9 @@ def build_triage_agents(cfg: HarnessConfig, profile: TestProfile) -> list[CliTri
     models = voter_models(cfg, profile)
     if problem := diversity_problem(cfg, models):
         raise ValueError(problem)
+    if problem := load_policy(cfg.model_policy).problem(models, "triage", profile.product):
+        raise ValueError(problem)
     skill = load_skill(cfg.skills_dir / "t07-triage" / "SKILL.md")
     runner = CliAgentRunner(rc)
-    masker = Masker(categories=profile.logs.masking)
+    masker = Masker(categories=profile.logs.masking, correlation_keys=profile.correlation_keys())
     return [CliTriageAgent(f"cli-triage-{i + 1}", runner, skill, m, masker) for i, m in enumerate(models)]

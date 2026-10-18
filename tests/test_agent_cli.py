@@ -116,8 +116,8 @@ def test_voters_use_profile_model_or_configured_models():
     profile = load_profile(ROOT / "examples/settlenxt/test-profile.yaml")
     cfg = HarnessConfig(agentRunner=AgentRunnerConfig(command=["ainxt", "-p", "{prompt}"]))
     assert [a.model for a in build_triage_agents(cfg, profile)] == ["local/onprem-reasoner"] * 3
-    cfg.agent_runner.models = ["m1", "m2"]
-    assert [a.model for a in build_triage_agents(cfg, profile)] == ["m1", "m2", "m1"]
+    cfg.agent_runner.models = ["onprem-a", "onprem-b"]
+    assert [a.model for a in build_triage_agents(cfg, profile)] == ["onprem-a", "onprem-b", "onprem-a"]
 
 
 def test_triage_agent_masks_before_sending(mode):

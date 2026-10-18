@@ -48,4 +48,5 @@ agentRunner:
     AINXT_MAX_RETRIES: "2"          # default 15 can keep a headless run silent for ~6 minutes
     AINXT_DISABLE_AUTOUPDATER: "1"
 
+# modelPolicy: /etc/ath/model-policy.yaml   # default: config/model-policy.yaml of the install
 # skillsDir: ../skills              # stage skills; relative to this file. Default: the install's skills/.

@@ -21,12 +21,19 @@ ainxt-ath/
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[server,dev]"
-pytest                                   # 60 tests, no network needed
+pytest                                   # 99 tests, no network needed
 
 ainxt-ath doctor examples/settlenxt/test-profile.local.yaml
 ainxt-ath run --profile examples/settlenxt/test-profile.local.yaml \
   --commit mr001 --merge-base base000 --env uat1 \
   --changed src/main/java/clearing/Dispute.java
+```
+
+To install on a machine without the source checkout, build a wheel. Skills, the model policy and the
+onboarding templates are included and install to `<prefix>/share/ainxt-ath/`:
+
+```bash
+pip wheel --no-deps . -w dist/ && pip install "dist/ainxt_ath-0.1.0-py3-none-any.whl[server]"
 ```
 
 The demo runs the full report-only pipeline against fake Jenkins, fake suites and a fake
@@ -49,6 +56,7 @@ API: `ATH_PROFILES=examples/settlenxt uvicorn ath_server.api.app:app --reload`, 
 | T2 rule-based selection, T4 deploy, T5 run + merge-base baseline cache, T6 normalize | Done |
 | T7 pre-checks (known failure, quarantine, pre-existing, flaky retry), voting + 2-of-3 quorum | Done |
 | T7 triage agents through a headless agent CLI (AiNxt CLI) | Done; tested with a fake CLI |
+| Evidence-checked votes, model-family diversity, model policy (data classes) | Done |
 | T9 Markdown report | Done; posting to MR/Jira is a TODO |
 | Log sources: log-api (HTTP), ssh (server-only, skeleton), fake | Partly |
 | Jenkins adapter (webhook or API trigger, test-report or artifact results) | Done; tested against a mock Jenkins |
@@ -103,6 +111,17 @@ line, TSD clause or the failure message). ATH checks the quote; a vote with no q
 is discarded as `unknown`, with a note in the ATRF. Verified quotes appear as evidence in the report.
 Set `minFamilies` with `modelFamilies` to require voters from different model families. Today
 this drives T7 triage; T1, T3, T10 and T11 will use the same runner.
+
+## Model policy
+
+[`config/model-policy.yaml`](config/model-policy.yaml) says which models may see which data. Each LLM
+stage sees a data class (masked test results and logs are still `restricted`), and each class lists the
+model-name globs allowed to receive it. By default only `local/*` and `onprem-*` models qualify.
+
+ATH refuses a run whose triage voters are not allowed, and `doctor` also checks every per-stage model in
+the product profile. The file is platform-owned: products cannot opt their own data into cloud models;
+approved exceptions go under `productOverrides`. Point a harness config at another file with
+`modelPolicy:`; a missing or invalid policy stops LLM stages (there is no permissive default).
 
 ## Connecting your Jenkins
 

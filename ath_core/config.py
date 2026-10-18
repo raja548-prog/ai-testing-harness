@@ -18,7 +18,9 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-DEFAULT_SKILLS_DIR = Path(__file__).resolve().parents[1] / "skills"
+from ath_core.assets import asset_path
+
+DEFAULT_SKILLS_DIR = asset_path("skills")
 # Flags that make an agent CLI approve every tool call. ATH never runs a session with them:
 # a prompt-injected log line could otherwise run commands unchallenged.
 AUTO_APPROVE_FLAGS = ("--yolo", "--always-approve", "bypassPermissions", "--dangerously-skip-permissions")
@@ -70,6 +72,7 @@ class AgentRunnerConfig(_Model):
 class HarnessConfig(_Model):
     agent_runner: AgentRunnerConfig | None = Field(None, alias="agentRunner")
     skills_dir: Path = Field(DEFAULT_SKILLS_DIR, alias="skillsDir")
+    model_policy: Path | None = Field(None, alias="modelPolicy")  # default: config/model-policy.yaml of the install
     source: Path | None = Field(None, exclude=True)
 
 
@@ -91,6 +94,8 @@ def load_config(explicit: str | Path | None = None) -> HarnessConfig:
             cfg = HarnessConfig.model_validate(data)
             if not cfg.skills_dir.is_absolute():
                 cfg.skills_dir = (path.parent / cfg.skills_dir).resolve()
+            if cfg.model_policy and not cfg.model_policy.is_absolute():
+                cfg.model_policy = (path.parent / cfg.model_policy).resolve()
             cfg.source = path
             return cfg
     return HarnessConfig()

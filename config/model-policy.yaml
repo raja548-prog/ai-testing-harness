@@ -1,0 +1,23 @@
+# ATH model policy: which models may see which data. Platform-owned; changes need security review.
+# Patterns are globs over model names as the agent CLI knows them (`ainxt models`).
+# Masked data is still `restricted`: masking is regex-based and can miss things.
+
+dataClasses:
+  restricted:          # test results, failure messages, UAT logs, test data (masked)
+    allowed: ["local/*", "onprem-*"]
+  internal:            # source diffs, TSD text, product skill: no payment data
+    allowed: ["local/*", "onprem-*"]
+  public:              # nothing product-specific
+    allowed: ["*"]
+
+stages:                # what each LLM stage sends to its model; a stage not listed is `restricted`
+  impact: internal     # T1: diff + TSD + product skill
+  author: internal     # T3: TSD clauses + test conventions
+  triage: restricted   # T7: masked case, logs, diff
+  remediate: restricted  # T10: failures, logs, code
+  validate: restricted   # T11: rerun results, fix diff
+
+# Per-product exceptions, approved by the platform team (e.g. a cloud model for code-only stages):
+# productOverrides:
+#   settlenxt: { impact: public, author: public }
+productOverrides: {}

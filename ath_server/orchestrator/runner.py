@@ -52,7 +52,7 @@ class Orchestrator:
         self.agents = agents or []
         self.quarantined = quarantined or set()
         self.report_dir = Path(report_dir) if report_dir else None
-        self.masker = Masker(categories=profile.logs.masking)
+        self.masker = Masker(categories=profile.logs.masking, correlation_keys=profile.correlation_keys())
         self._atrf: dict[str, ATRFRun] = {}
         self._baseline: dict[str, ATRFRun] = {}
 

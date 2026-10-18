@@ -134,6 +134,13 @@ class TestProfile(_Model):
             raise ValueError(f"unsupported apiVersion {v!r}; supported: {sorted(SUPPORTED_API_VERSIONS)}")
         return v
 
+    def correlation_keys(self) -> list[str]:
+        """Correlation keys the product declares on its log sources (e.g. rrn, stan, batchId)."""
+        keys: list[str] = []
+        for src in self.logs.sources:
+            keys += [k for k in src.params.get("keys") or [] if isinstance(k, str) and k not in keys]
+        return keys
+
     def suite(self, suite_id: str) -> SuiteConfig:
         for s in self.suites:
             if s.id == suite_id:

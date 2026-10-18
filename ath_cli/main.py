@@ -15,6 +15,7 @@ from ath_core.adapters import AdapterError, registry
 from ath_core.adapters import loader  # noqa: F401
 from ath_core.agents.cli import build_triage_agents, diversity_problem, load_skill, model_family, voter_models
 from ath_core.config import load_config
+from ath_core.policy import load_policy
 from ath_core.schemas import RunContext, RunMode, load_profile
 from ath_server.orchestrator import Orchestrator, StateStore
 
@@ -59,6 +60,7 @@ def cmd_doctor(a: argparse.Namespace) -> int:
         for problem in problems:
             print(f"      - {problem}")
     bad += _doctor_agent_runner(a)
+    bad += _doctor_model_policy(a, p)
     # TODO (platform): check the user's Git/Jira profile tokens and env reachability.
     print("doctor: all adapters available and configured" if not bad else f"doctor: {bad} adapter(s) missing or misconfigured")
     return 0 if not bad else 2
@@ -82,9 +84,15 @@ def _doctor_agent_runner(a: argparse.Namespace) -> int:
         load_skill(cfg.skills_dir / "t07-triage" / "SKILL.md")
     except OSError as e:
         problems.append(f"triage skill not readable: {e}")
-    models = voter_models(cfg, load_profile(a.profile))
+    profile = load_profile(a.profile)
+    models = voter_models(cfg, profile)
     if problem := diversity_problem(cfg, models):
         problems.append(problem)
+    try:
+        if problem := load_policy(cfg.model_policy).problem(models, "triage", profile.product):
+            problems.append(problem)
+    except ValueError as e:
+        problems.append(str(e))
     print(f"  [{'ok' if not problems else 'CONFIG'}] agent runner: {rc.command[0]} x{rc.voters} voters "
           f"(from {cfg.source})")
     families = [model_family(m, rc.model_families) or "unclassified" for m in models]
@@ -93,6 +101,24 @@ def _doctor_agent_runner(a: argparse.Namespace) -> int:
     if len(set(families)) == 1 and rc.voters > 1:
         print("      note: all voters share one model family, so their votes are correlated; "
               "see minFamilies in examples/ath-config.yaml")
+    for problem in problems:
+        print(f"      - {problem}")
+    return 1 if problems else 0
+
+
+def _doctor_model_policy(a: argparse.Namespace, profile) -> int:
+    """Check the profile's per-stage models against the model policy. Returns 1 on a violation."""
+    try:
+        policy = load_policy(load_config(a.config).model_policy)
+    except Exception as e:  # missing or invalid policy file
+        print(f"  [CONFIG] model policy: {e}")
+        return 1
+    problems = []
+    if profile.models:
+        for stage in sorted(policy.stages):
+            if problem := policy.problem([profile.models.for_stage(stage)], stage, profile.product):
+                problems.append(problem)
+    print(f"  [{'ok' if not problems else 'CONFIG'}] model policy: {policy.source}")
     for problem in problems:
         print(f"      - {problem}")
     return 1 if problems else 0

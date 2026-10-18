@@ -21,7 +21,7 @@ selection:
       run:  [smoke, regression]
 logs:
   sources:
-    - { adapter: log-api }       # no endpoint configured: falls back to the next source
+    - { adapter: log-api, keys: [rrn, stan, batchId] }   # no endpoint: falls back to the next source
     - { adapter: fake-logs }
 policy:
   flakyRetries: 2

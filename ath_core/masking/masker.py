@@ -59,9 +59,19 @@ def luhn_valid(digits: str) -> bool:
 
 @dataclass
 class Masker:
-    """Masks the categories listed in a profile's `logs.masking`."""
+    """Masks the categories listed in a profile's `logs.masking`.
+
+    `correlation_keys` (the product's declared keys, e.g. rrn, stan) exempt only the Aadhaar rule
+    for a number written directly as that key's value (`rrn=…`, `rrn: …`, `"rrn": "…"`): RRNs are
+    12 digits and about 1 in 10 pass the Verhoeff check by chance. Every other rule still applies.
+    """
     categories: list[str] = field(default_factory=lambda: ["pan", "cvv", "track2", "aadhaar", "mobile"])
+    correlation_keys: list[str] = field(default_factory=list)
     hits: dict[str, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        keys = "|".join(re.escape(k) for k in self.correlation_keys if k)
+        self._key_value = re.compile(rf"(?i)\b(?:{keys})[\"']?\s*[:=]\s*[\"']?$") if keys else None
 
     def _count(self, cat: str) -> None:
         self.hits[cat] = self.hits.get(cat, 0) + 1
@@ -69,6 +79,8 @@ class Masker:
     def _aadhaar(self, m: re.Match) -> str:
         if not verhoeff_valid(re.sub(r"\s", "", m.group(0))):
             return m.group(0)  # e.g. an RRN: 12 digits, but not an Aadhaar number
+        if self._key_value and self._key_value.search(m.string[max(0, m.start() - 40):m.start()]):
+            return m.group(0)  # the value of a declared correlation key, e.g. rrn=…
         self._count("aadhaar")
         return "[AADHAAR]"
 

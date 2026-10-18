@@ -19,5 +19,17 @@ ainxt-ath = "ath_cli.main:main"
 [tool.setuptools.packages.find]
 include = ["ath_core*", "ath_server*", "ath_cli*"]
 
+# Skills, model policy and templates install to <prefix>/share/ainxt-ath/ (found by ath_core/assets.py).
+# One entry per folder: data files are copied flat. tests/test_packaging.py fails if a folder is missing.
+[tool.setuptools.data-files]
+"share/ainxt-ath/config" = ["config/*.yaml"]
+"share/ainxt-ath/skills/_shared" = ["skills/_shared/*.md"]
+"share/ainxt-ath/skills/t01-impact" = ["skills/t01-impact/*.md"]
+"share/ainxt-ath/skills/t03-author" = ["skills/t03-author/*.md"]
+"share/ainxt-ath/skills/t07-triage" = ["skills/t07-triage/*.md"]
+"share/ainxt-ath/skills/t10-remediate" = ["skills/t10-remediate/*.md"]
+"share/ainxt-ath/skills/t11-validate" = ["skills/t11-validate/*.md"]
+"share/ainxt-ath/templates/product-package" = ["templates/product-package/*.md", "templates/product-package/*.yaml"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
