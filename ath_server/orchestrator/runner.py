@@ -21,12 +21,14 @@ from typing import Any, Callable
 
 from ath_core.adapters import AdapterError, ExecStatus, MaskedLogs, RawResults, registry
 from ath_core.adapters import loader  # noqa: F401  (registers built-in adapters)
+from ath_core.context import diff_excerpt, tsd_excerpt
+from ath_core.gates import approval_problem, rejection_problem
 from ath_core.masking import Masker
 from ath_core.report.markdown import render_report
 from ath_core.schemas.atrf import ATRFCase, ATRFRun, Triage, TriageCategory
 from ath_core.schemas.profile import TestProfile
 from ath_core.schemas.run import (
-    RunContext, RunManifest, RunMode, RunStatus, Stage, StageResult, StageStatus, utcnow,
+    GateDecision, RunContext, RunManifest, RunMode, RunStatus, Stage, StageResult, StageStatus, utcnow,
 )
 from ath_core.stages.select import select_suites
 from ath_core.triage.precheck import apply_prechecks, mark_flaky
@@ -45,8 +47,9 @@ class GateRequired(Exception):
 class Orchestrator:
     def __init__(self, profile: TestProfile, store: StateStore, package_version: str = "dev",
                  agents: list[TriageAgent] | None = None, quarantined: set[str] | None = None,
-                 report_dir: str | Path | None = None):
+                 report_dir: str | Path | None = None, profile_ref: str | None = None):
         self.profile = profile
+        self.profile_ref = profile_ref
         self.store = store
         self.package_version = package_version
         self.agents = agents or []
@@ -57,19 +60,67 @@ class Orchestrator:
         self._baseline: dict[str, ATRFRun] = {}
 
     # ---------------------------------------------------------------- public API
-    def start(self, ctx: RunContext) -> RunManifest:
+    def start(self, ctx: RunContext, context: dict[str, str] | None = None) -> RunManifest:
+        """Start (or continue) a run. `context` holds change context for LLM stages:
+        {"diff": unified diff, "tsd": TSD markdown}. It is masked and stored with the run."""
         self._guard(ctx)
-        m = self.store.load_manifest(ctx.run_id) or RunManifest(
-            context=ctx, core_version=CORE_VERSION, package_version=self.package_version,
-            profile_hash=hashlib.sha256(self.profile.model_dump_json().encode()).hexdigest()[:16],
-        )
+        m = self.store.load_manifest(ctx.run_id)
+        if m is None:
+            m = RunManifest(context=ctx, core_version=CORE_VERSION, package_version=self.package_version,
+                            profile_hash=self._profile_hash(), profile_ref=self.profile_ref)
+            for name, text in (context or {}).items():
+                masked = self.masker.mask(text)
+                self.store.put_artifact(ctx.run_id, f"context/{name}", masked)
+                m.inputs[name] = hashlib.sha256(masked.encode()).hexdigest()
         return self._execute(m)
 
     def resume(self, run_id: str) -> RunManifest:
+        m = self._load(run_id)
+        if m.status == RunStatus.REJECTED:
+            raise ValueError(f"run {run_id} was rejected at a gate and cannot be resumed")
+        return self._execute(m)
+
+    def approve(self, run_id: str, stage: Stage, user: str, groups: list[str], comment: str = "") -> RunManifest:
+        """Record an approval (separation of duties applies), then continue the run past the gate."""
+        return self._execute(self.record_gate(run_id, stage, "approved", user, groups, comment))
+
+    def reject(self, run_id: str, stage: Stage, user: str, groups: list[str], comment: str = "") -> RunManifest:
+        """Stop the run at a gate. Artifacts are kept; the env hold is released."""
+        return self.record_gate(run_id, stage, "rejected", user, groups, comment)
+
+    def record_gate(self, run_id: str, stage: Stage, decision: str, user: str, groups: list[str],
+                    comment: str = "") -> RunManifest:
+        """Check and record a gate decision without running anything (the API resumes in the background).
+
+        Raises PermissionError when the decider may not decide, ValueError if the profile changed."""
+        m = self._load(run_id)
+        if m.profile_hash != self._profile_hash():
+            raise ValueError(f"the profile changed since run {run_id} started; decide with the profile it ran with")
+        rule = approval_problem if decision == "approved" else rejection_problem
+        if problem := rule(m, stage, user, groups, self.profile.owners):
+            raise PermissionError(problem)
+        m.gates.append(GateDecision(stage=stage, decision=decision, by=user, groups=groups, comment=comment))
+        self.store.event(run_id, stage.value, f"gate.{decision}", by=user, groups=groups, comment=comment)
+        if decision == "rejected":
+            res = m.stages[stage]
+            res.status, res.error, res.finished_at = StageStatus.REJECTED, f"rejected by {user}: {comment}", utcnow()
+            self.store.checkpoint(run_id, res)
+            m.status = RunStatus.REJECTED
+            self._release_env(m.context)
+        self.store.save_manifest(m)
+        return m
+
+    def _load(self, run_id: str) -> RunManifest:
         m = self.store.load_manifest(run_id)
         if m is None:
             raise KeyError(f"unknown run {run_id}")
-        return self._execute(m)
+        return m
+
+    def _profile_hash(self) -> str:
+        return hashlib.sha256(self.profile.model_dump_json().encode()).hexdigest()[:16]
+
+    def _approval(self, stage: Stage) -> GateDecision | None:
+        return next((g for g in self._m.gates if g.stage == stage and g.decision == "approved"), None)
 
     # ---------------------------------------------------------------- core loop
     def _plan(self, mode: RunMode) -> list[tuple[Stage, Callable[[RunContext], dict[str, Any]]]]:
@@ -86,6 +137,7 @@ class Orchestrator:
 
     def _execute(self, m: RunManifest) -> RunManifest:
         ctx = m.context
+        self._m = m  # stage functions read gate decisions from it
         m.status = RunStatus.RUNNING
         self.store.save_manifest(m)
         try:
@@ -159,6 +211,8 @@ class Orchestrator:
     def t3_author(self, ctx: RunContext) -> dict[str, Any]:
         if ctx.mode == RunMode.REPORT_ONLY or self.profile.test_authoring is None:
             return {"_skipped": True, "reason": "test authoring disabled in this mode"}
+        if approved := self._approval(Stage.T3_AUTHOR):
+            return {"_skipped": True, "reason": f"test authoring is not implemented yet; gate approved by {approved.by}"}
         raise GateRequired("T3: approve proposed test changes")
 
     def t4_env(self, ctx: RunContext) -> dict[str, Any]:
@@ -212,6 +266,8 @@ class Orchestrator:
 
     def t7_triage(self, ctx: RunContext) -> dict[str, Any]:
         counts: dict[str, int] = {}
+        diff = self.store.get_artifact(ctx.run_id, "context/diff") or ""
+        tsd = self.store.get_artifact(ctx.run_id, "context/tsd") or ""
         for suite, run in self._atrf.items():
             cfg = self.profile.suite(suite)
             ex = registry.create("executor", cfg.executor.adapter, **cfg.executor.params)
@@ -220,8 +276,14 @@ class Orchestrator:
             if remaining:
                 remaining = mark_flaky(remaining, self._passed_on_retry(ex, ctx, suite, {c.id for c in remaining}))
             for case in remaining:
-                evidence = {"logs": self._logs_for(ctx, case).lines, "diff_ref": ctx.commit}
+                evidence = {"logs": self._logs_for(ctx, case).lines, "diff_ref": ctx.commit,
+                            "diff": diff_excerpt(diff, case) if diff else "",
+                            "tsd": tsd_excerpt(tsd, case) if tsd else ""}
                 case.triage = vote(case, self.agents, evidence) if self.agents else None
+                for agent in self.agents:  # audit: one event per model call (hashes, never content)
+                    if getattr(agent, "last_call", None):
+                        self.store.event(ctx.run_id, "T7", "agent.call", case=case.id, agent=agent.name,
+                                         **agent.last_call)
             for c in run.failing():
                 key = c.triage.category.value if c.triage else "untriaged"
                 counts[key] = counts.get(key, 0) + 1
@@ -255,7 +317,15 @@ class Orchestrator:
         return {"report": str(path) if path else "artifact:report.md"}
 
     def t10_remediate(self, ctx: RunContext) -> dict[str, Any]:
-        raise GateRequired("T10: remediation not implemented in scaffold; approve to continue manually")
+        regressions = [c.id for run in self._atrf.values() for c in run.failing()
+                       if c.triage and c.triage.category == TriageCategory.CODE_REGRESSION]
+        if not regressions:
+            return {"_skipped": True, "reason": "no code-regression failures to remediate"}
+        if approved := self._approval(Stage.T10_REMEDIATE):
+            return {"_skipped": True, "cases": regressions,
+                    "reason": f"remediation is not implemented yet; redeploy gate approved by {approved.by}"}
+        raise GateRequired(f"T10: approve redeploy of a fix for {len(regressions)} code-regression "
+                           f"failure(s): {', '.join(regressions)}")
 
     def t11_validate(self, ctx: RunContext) -> dict[str, Any]:
         return {"_skipped": True}

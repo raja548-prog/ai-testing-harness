@@ -1,0 +1,5 @@
+id: tr-003
+category: code-regression
+why: The diff remapped insufficient funds to 05; the TSD only adds code 62.
+tags:
+- iso

@@ -1,0 +1,20 @@
+id: tr-018
+case:
+  id: SNX-REG-0118
+  name: Nightly reconciliation
+  suite: regression
+  status: failed
+  failure:
+    type: error
+    message: ''
+    trace: ''
+  tags:
+  - reporting
+logs: []
+diff: ''
+tsd: ''
+product: |
+  SettleNxt clears and settles card transactions. Modules: clearing (fee calculation, batch totals),
+  dispute (chargebacks, reversals), iso (ISO 8583 packing, DE48 validation, response codes),
+  reporting (settlement reports), refund (refund API). Known flaky area: reporting export timing.
+  Simulators: sim-rupay (issuer), sim-acq (acquirer). Logs carry rrn, stan and batchId.

@@ -1,0 +1,27 @@
+id: tr-015
+case:
+  id: SNX-REG-0115
+  name: Settlement event is published
+  suite: regression
+  status: failed
+  failure:
+    type: error
+    message: 'org.apache.kafka.common.errors.TimeoutException: Topic settlement-events not present in metadata after
+      60000 ms'
+    trace: ''
+  tags:
+  - events
+logs:
+- 2026-10-16T10:15:01+05:30 WARN  NetworkClient Connection to node -1 (kafka.uat1.internal:9092) could not be established
+diff: |
+  --- a/clearing/FeeCalculator.java
+  +++ b/clearing/FeeCalculator.java
+  @@ -10,1 +10,1 @@
+  -// fees
+  +// fee calculation
+tsd: ''
+product: |
+  SettleNxt clears and settles card transactions. Modules: clearing (fee calculation, batch totals),
+  dispute (chargebacks, reversals), iso (ISO 8583 packing, DE48 validation, response codes),
+  reporting (settlement reports), refund (refund API). Known flaky area: reporting export timing.
+  Simulators: sim-rupay (issuer), sim-acq (acquirer). Logs carry rrn, stan and batchId.

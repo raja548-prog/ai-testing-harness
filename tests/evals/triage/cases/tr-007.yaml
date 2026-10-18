@@ -1,0 +1,27 @@
+id: tr-007
+case:
+  id: SNX-REG-0107
+  name: Settlement report header
+  suite: regression
+  status: failed
+  failure:
+    type: assertion
+    message: expected header 'rrn,amount,status' got 'rrn,status,amount'
+    trace: ''
+  tags:
+  - reporting
+logs:
+- 2026-10-16T10:08:04+05:30 INFO  ReportWriter columns=rrn,status,amount
+diff: |
+  --- a/reporting/ReportWriter.java
+  +++ b/reporting/ReportWriter.java
+  @@ -22,7 +22,7 @@
+  -    static final String[] COLUMNS = {"rrn", "amount", "status"};
+  +    static final String[] COLUMNS = {"rrn", "status", "amount"};
+tsd: |
+  SNX-1880: Settlement report columns are ordered rrn, status, amount, as requested by finance.
+product: |
+  SettleNxt clears and settles card transactions. Modules: clearing (fee calculation, batch totals),
+  dispute (chargebacks, reversals), iso (ISO 8583 packing, DE48 validation, response codes),
+  reporting (settlement reports), refund (refund API). Known flaky area: reporting export timing.
+  Simulators: sim-rupay (issuer), sim-acq (acquirer). Logs carry rrn, stan and batchId.

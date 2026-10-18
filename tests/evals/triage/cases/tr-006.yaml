@@ -1,0 +1,29 @@
+id: tr-006
+case:
+  id: SNX-REG-0106
+  name: Refund on day 40 is rejected
+  suite: regression
+  status: failed
+  failure:
+    type: assertion
+    message: expected status=REJECTED got ACCEPTED
+    trace: ''
+  correlation:
+    rrn: '629014773306'
+  tags:
+  - refund
+logs:
+- 2026-10-16T10:07:01+05:30 INFO  RefundService rrn=629014773306 age=40d window=45d accepted
+diff: |
+  --- a/refund/RefundPolicy.java
+  +++ b/refund/RefundPolicy.java
+  @@ -9,7 +9,7 @@ public class RefundPolicy {
+  -    static final int WINDOW_DAYS = 30;
+  +    static final int WINDOW_DAYS = 45;
+tsd: |
+  SNX-1834 §2.1: The refund window is extended from 30 to 45 days.
+product: |
+  SettleNxt clears and settles card transactions. Modules: clearing (fee calculation, batch totals),
+  dispute (chargebacks, reversals), iso (ISO 8583 packing, DE48 validation, response codes),
+  reporting (settlement reports), refund (refund API). Known flaky area: reporting export timing.
+  Simulators: sim-rupay (issuer), sim-acq (acquirer). Logs carry rrn, stan and batchId.

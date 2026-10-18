@@ -6,6 +6,7 @@ platform, the same commands call the ATH API with the user's SSO token instead.
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import sys
 import uuid
@@ -15,8 +16,9 @@ from ath_core.adapters import AdapterError, registry
 from ath_core.adapters import loader  # noqa: F401
 from ath_core.agents.cli import build_triage_agents, diversity_problem, load_skill, model_family, voter_models
 from ath_core.config import load_config
+from ath_core.context import read_rh_package
 from ath_core.policy import load_policy
-from ath_core.schemas import RunContext, RunMode, load_profile
+from ath_core.schemas import RunContext, RunMode, Stage, load_profile
 from ath_server.orchestrator import Orchestrator, StateStore
 
 KIND_FOR = {"build": "pipeline", "deploy": "pipeline"}
@@ -132,7 +134,20 @@ def _orch(a: argparse.Namespace) -> Orchestrator:
     if getattr(a, "quarantine", None):
         quarantined = {l.strip() for l in Path(a.quarantine).read_text().splitlines() if l.strip()}
     return Orchestrator(profile, store, package_version=a.package_version, quarantined=quarantined,
-                        report_dir=a.report_dir, agents=agents)
+                        report_dir=a.report_dir, agents=agents, profile_ref=str(a.profile))
+
+
+def _context(a: argparse.Namespace) -> dict[str, str]:
+    """Change context for LLM stages from --diff, --tsd and --rh-package."""
+    ctx: dict[str, str] = {}
+    if a.diff:
+        ctx["diff"] = Path(a.diff).read_text(encoding="utf-8")
+    tsd = [Path(a.tsd).read_text(encoding="utf-8")] if a.tsd else []
+    if a.rh_package:
+        tsd.append(read_rh_package(a.rh_package))
+    if tsd:
+        ctx["tsd"] = "\n\n".join(tsd)
+    return ctx
 
 
 def _print_result(m) -> int:
@@ -155,8 +170,8 @@ def cmd_run(a: argparse.Namespace) -> int:
         env=a.env, changed_paths=a.changed or [], triggered_by=a.user, trigger_source="cli",
     )
     try:
-        m = orch.start(ctx)
-    except (ValueError, AdapterError) as e:
+        m = orch.start(ctx, context=_context(a))
+    except (ValueError, OSError, AdapterError) as e:
         print(f"refused: {e}")
         return 1
     rc = _print_result(m)
@@ -168,17 +183,68 @@ def cmd_run(a: argparse.Namespace) -> int:
 
 def cmd_resume(a: argparse.Namespace) -> int:
     try:
-        orch = _orch(a)
-    except ValueError as e:
-        print(f"refused: {e}")
+        return _print_result(_orch(a).resume(a.run_id))
+    except (KeyError, ValueError) as e:  # unknown run, rejected run, or a config problem
+        print(f"refused: {e.args[0] if e.args else e}")
         return 1
-    return _print_result(orch.resume(a.run_id))
+
+
+def cmd_gate(a: argparse.Namespace) -> int:
+    """approve / reject a HITL gate. --groups stands in for the user's SSO groups."""
+    try:
+        orch = _orch(a)
+        stage = Stage(a.gate)
+        groups = [g.strip() for g in (a.groups or "").split(",") if g.strip()]
+        decide = orch.approve if a.decision == "approved" else orch.reject
+        m = decide(a.run_id, stage, a.user, groups, a.comment or "")
+    except (KeyError, ValueError, PermissionError) as e:
+        print(f"refused: {e.args[0] if e.args else e}")
+        return 1
+    if a.decision == "rejected":
+        print(f"run {a.run_id}: rejected at {stage.value} by {a.user}")
+        return 0
+    return _print_result(m)
 
 
 def cmd_report(a: argparse.Namespace) -> int:
     body = StateStore(a.db).get_artifact(a.run_id, "report.md")
     print(body or f"no report for {a.run_id}")
     return 0 if body else 1
+
+
+def cmd_eval(a: argparse.Namespace) -> int:
+    """Replay a labelled dataset through the configured triage voters and gate on the scores."""
+    from ath_core.evals import triage as ev  # only needed here
+
+    try:
+        profile = load_profile(a.profile)
+        agents = build_triage_agents(load_config(a.config), profile)
+        dataset = ev.load_dataset(a.dataset)
+    except (ValueError, OSError) as e:
+        print(f"refused: {e}")
+        return 1
+    if not agents:
+        print("refused: no agent runner configured; set agentRunner in the harness config (see examples/ath-config.yaml)")
+        return 1
+    print(f"evaluating {len(dataset)} cases with {len(agents)} voters ({', '.join(a_.model for a_ in agents)})")
+    def progress(i: int, n: int, o) -> None:
+        mark = "ok   " if o.correct else "WRONG"
+        print(f"  [{i:>2}/{n}] {mark} {o.id}: {o.predicted:<15} truth {o.truth:<15} votes {', '.join(o.votes)}",
+              flush=True)
+
+    outcomes = ev.run_eval(dataset, agents, progress=progress)
+    s = ev.score(outcomes)
+    report = ev.render_md(s, outcomes, title=f"Triage eval: {Path(a.dataset).name}")
+    out = Path(a.out or f".ath/evals/triage-{uuid.uuid4().hex[:8]}")
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "report.md").write_text(report, encoding="utf-8")
+    (out / "results.json").write_text(json.dumps(ev.to_json(s, outcomes), indent=1), encoding="utf-8")
+    print(report)
+    print(f"results: {out}")
+    failures = ev.threshold_failures(s, a.min_accuracy, a.max_missed_regressions)
+    for f in failures:
+        print(f"GATE FAILED: {f}")
+    return 3 if failures else 0
 
 
 def cmd_events(a: argparse.Namespace) -> int:
@@ -220,7 +286,22 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--user", default="local-user", help="SSO user id (set by the platform)")
     r.add_argument("--run-id")
     r.add_argument("--quiet", action="store_true")
+    r.add_argument("--diff", help="unified diff of the MR, for triage context (git diff <merge-base>..<commit>)")
+    r.add_argument("--tsd", help="TSD markdown for triage context")
+    r.add_argument("--rh-package", help="Requirement-Harness SDLC package (manifest.json or its folder): "
+                                        "its approved TSD, hash-checked, is used as context")
     r.set_defaults(fn=cmd_run)
+
+    for name, decision, help_ in (("approve", "approved", "approve a gate and continue the run"),
+                                  ("reject", "rejected", "reject a gate and stop the run")):
+        g = sub.add_parser(name, help=help_)
+        common(g)
+        g.add_argument("run_id")
+        g.add_argument("--gate", required=True, choices=["T3", "T10", "T11"], help="the gate the run waits at")
+        g.add_argument("--user", required=True, help="who decides (SSO user id in the platform)")
+        g.add_argument("--groups", help="comma-separated groups of that user (SSO groups in the platform)")
+        g.add_argument("--comment", help="reason, recorded with the decision")
+        g.set_defaults(fn=cmd_gate, decision=decision)
 
     rs = sub.add_parser("resume", help="resume a run from its last checkpoint")
     common(rs)
@@ -231,6 +312,16 @@ def build_parser() -> argparse.ArgumentParser:
     rp.add_argument("run_id")
     rp.add_argument("--db", default=".ath/state.db")
     rp.set_defaults(fn=cmd_report)
+
+    e = sub.add_parser("eval", help="score triage voters on a labelled dataset (exit 3 if a gate fails)")
+    e.add_argument("dataset", help="folder with cases/ and truth/, e.g. tests/evals/triage")
+    e.add_argument("--profile", required=True, help="profile for masking, correlation keys and the model policy")
+    e.add_argument("--config", help="harness config (default: $ATH_CONFIG, .ath/config.yaml, ~/.config/ainxt/ath.yaml)")
+    e.add_argument("--out", help="folder for report.md and results.json (default .ath/evals/triage-<id>)")
+    e.add_argument("--min-accuracy", type=float, help="fail if accuracy is below this, e.g. 0.8")
+    e.add_argument("--max-missed-regressions", type=int, default=0,
+                   help="fail if more real regressions get a non-blocking verdict (default 0)")
+    e.set_defaults(fn=cmd_eval)
 
     ev = sub.add_parser("events", help="print a run's structured events")
     ev.add_argument("run_id")

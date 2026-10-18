@@ -1,0 +1,5 @@
+id: tr-010
+category: test-data
+why: BIN 652150 is missing from the bin_master fixture; the diff only touches a portal label.
+tags:
+- routing

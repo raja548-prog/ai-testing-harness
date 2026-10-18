@@ -1,0 +1,26 @@
+id: tr-009
+case:
+  id: SNX-REG-0109
+  name: Decline message text
+  suite: regression
+  status: failed
+  failure:
+    type: assertion
+    message: expected message 'Txn declined' got 'Transaction declined'
+    trace: ''
+  tags:
+  - iso
+logs: []
+diff: |
+  --- a/iso/Messages.java
+  +++ b/iso/Messages.java
+  @@ -5,1 +5,1 @@
+  -    DECLINED = "Txn declined";
+  +    DECLINED = "Transaction declined";
+tsd: |
+  SNX-1890: Customer-facing messages use full words, e.g. 'Transaction declined'.
+product: |
+  SettleNxt clears and settles card transactions. Modules: clearing (fee calculation, batch totals),
+  dispute (chargebacks, reversals), iso (ISO 8583 packing, DE48 validation, response codes),
+  reporting (settlement reports), refund (refund API). Known flaky area: reporting export timing.
+  Simulators: sim-rupay (issuer), sim-acq (acquirer). Logs carry rrn, stan and batchId.

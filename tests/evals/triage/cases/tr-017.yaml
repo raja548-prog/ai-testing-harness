@@ -1,0 +1,24 @@
+id: tr-017
+case:
+  id: SNX-REG-0117
+  name: Chargeback flow
+  suite: regression
+  status: failed
+  failure:
+    type: assertion
+    message: expected true but was false
+    trace: ''
+  tags:
+  - dispute
+logs: []
+diff: |
+  --- a/dispute/ChargebackService.java
+  +++ b/dispute/ChargebackService.java
+  @@ -1,200 +1,210 @@
+   (large refactor of the whole class)
+tsd: ''
+product: |
+  SettleNxt clears and settles card transactions. Modules: clearing (fee calculation, batch totals),
+  dispute (chargebacks, reversals), iso (ISO 8583 packing, DE48 validation, response codes),
+  reporting (settlement reports), refund (refund API). Known flaky area: reporting export timing.
+  Simulators: sim-rupay (issuer), sim-acq (acquirer). Logs carry rrn, stan and batchId.

@@ -1,0 +1,5 @@
+id: tr-012
+category: test-data
+why: The scenario data reuses one RRN for two purchases, so the switch rejects the second as a duplicate.
+tags:
+- iso

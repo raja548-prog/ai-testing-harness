@@ -1,0 +1,23 @@
+id: tr-012
+case:
+  id: SNX-REG-0112
+  name: Second purchase in scenario is approved
+  suite: regression
+  status: failed
+  failure:
+    type: assertion
+    message: expected DE39=00 got DE39=94
+    trace: ''
+  correlation:
+    rrn: '629014773312'
+  tags:
+  - iso
+logs:
+- 2026-10-16T10:12:01+05:30 WARN  DuplicateCheck rrn=629014773312 duplicate transaction (same rrn seen at 10:12:00)
+diff: ''
+tsd: ''
+product: |
+  SettleNxt clears and settles card transactions. Modules: clearing (fee calculation, batch totals),
+  dispute (chargebacks, reversals), iso (ISO 8583 packing, DE48 validation, response codes),
+  reporting (settlement reports), refund (refund API). Known flaky area: reporting export timing.
+  Simulators: sim-rupay (issuer), sim-acq (acquirer). Logs carry rrn, stan and batchId.

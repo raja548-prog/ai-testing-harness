@@ -21,7 +21,7 @@ ainxt-ath/
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[server,dev]"
-pytest                                   # 99 tests, no network needed
+pytest                                   # 138 tests, no network needed
 
 ainxt-ath doctor examples/settlenxt/test-profile.local.yaml
 ainxt-ath run --profile examples/settlenxt/test-profile.local.yaml \
@@ -57,6 +57,10 @@ API: `ATH_PROFILES=examples/settlenxt uvicorn ath_server.api.app:app --reload`, 
 | T7 pre-checks (known failure, quarantine, pre-existing, flaky retry), voting + 2-of-3 quorum | Done |
 | T7 triage agents through a headless agent CLI (AiNxt CLI) | Done; tested with a fake CLI |
 | Evidence-checked votes, model-family diversity, model policy (data classes) | Done |
+| Triage eval framework + 22 synthetic cases (`ainxt-ath eval`) | Done; real cases still needed |
+| Agent CLI process handling: tree kill, idle timeout, session resume, per-call audit events | Done |
+| HITL gates: `approve`/`reject` (CLI + API), separation of duties | Done; SSO groups and step-up still stubbed |
+| Triage context: diff + TSD excerpts, Requirement-Harness packages (hash-checked) | Done |
 | T9 Markdown report | Done; posting to MR/Jira is a TODO |
 | Log sources: log-api (HTTP), ssh (server-only, skeleton), fake | Partly |
 | Jenkins adapter (webhook or API trigger, test-report or artifact results) | Done; tested against a mock Jenkins |
@@ -68,8 +72,8 @@ API: `ATH_PROFILES=examples/settlenxt uvicorn ath_server.api.app:app --reload`, 
 1. **Wire real adapters** for the first pilot: GitLab trigger and poll, the department env-booking
    hold (`dept-env-booking`), and the UAT `log-api`.
 2. **Triage quality**: confirm the AiNxt CLI's headless flags in `examples/ath-config.yaml`, attach the
-   MR diff, TSD excerpt and product skill to the triage inputs, then build `tests/evals/` from real past
-   failures and measure precision before enabling it.
+   MR diff, TSD excerpt and product skill to the triage inputs, then add real past failures to
+   `tests/evals/triage/` and measure precision with `ainxt-ath eval` before enabling it.
 3. **Service hardening**: Postgres store, SSO JWT validation and run-scoped tokens, credential
    broker for Git/Jira, and durable workflows (e.g. Temporal) wrapping the stage functions.
 4. **More parsers**: allure-json, testng, cucumber-json, and the simulator CSV format.
@@ -111,6 +115,51 @@ line, TSD clause or the failure message). ATH checks the quote; a vote with no q
 is discarded as `unknown`, with a note in the ATRF. Verified quotes appear as evidence in the report.
 Set `minFamilies` with `modelFamilies` to require voters from different model families. Today
 this drives T7 triage; T1, T3, T10 and T11 will use the same runner.
+
+## Approval gates
+
+A run in `assist` or `autofix` mode stops at a HITL gate before T3 test changes and before T10
+redeploys a fix (T10 runs only when triage found `code-regression` failures). Decide with:
+
+```bash
+ainxt-ath approve <runId> --gate T10 --user lead-ravi --groups settlement-dept --comment "fix reviewed" --profile <p>
+ainxt-ath reject  <runId> --gate T10 --user lead-ravi --groups settlement-dept --comment "wrong fix" --profile <p>
+```
+
+or `POST /runs/{id}/gates/{T3|T10|T11}/{approve|reject}` with `X-ATH-User` and `X-ATH-Groups`.
+Separation of duties: the person who triggered the run cannot approve it (ATH acted on their behalf);
+the approver must be a named person in one of the profile's `owners` groups; service identities and the
+CLI's default user cannot decide. Anyone who may decide can reject; a rejected run stops with its
+artifacts kept and its env hold released. A decision made with a changed profile is refused.
+`--groups` and `X-ATH-Groups` stand in for SSO groups until SSO is wired.
+
+## Change context for triage
+
+Give triage the MR diff and the TSD, so voters can tell a regression from an intended change:
+
+```bash
+ainxt-ath run ... --diff mr.diff --tsd tsd.md
+ainxt-ath run ... --diff mr.diff --rh-package <rh-home>/packages/ER-0007    # Requirement-Harness package
+```
+
+For each failing case ATH sends the changed files and TSD sections most related to it (deterministic word
+overlap, size-capped). From a Requirement-Harness package it reads the approved TSD projections and checks
+each file against the hash recorded at sign-off, refusing a TSD edited afterwards; section footers
+(`ⓘ R-3 · AC-7`) keep requirement ids for tracing. Both inputs are masked and stored with the run, and
+their hashes are recorded in the run manifest. Every voter call is logged as an `agent.call` event with
+the model, session, attempts, duration and SHA-256 of prompt and response (never their text).
+
+## Triage evals
+
+`ainxt-ath eval <dataset> --profile <profile>` replays labelled failures through the configured triage
+voters and scores them: accuracy, precision and recall per category, **missed regressions** (a real bug
+given a non-blocking verdict), **false regressions** (the change blamed wrongly), and whether prompt
+injection was resisted. It writes `report.md` and `results.json`, and exits 3 when a gate fails
+(`--min-accuracy`, `--max-missed-regressions`, default 0; every injection case must be resisted).
+
+[`tests/evals/triage/`](tests/evals/triage/) holds 22 synthetic SettleNxt cases, including misleading
+logs and four injection attempts. Run it before approving a triage skill or model change. Real cases from
+past failures go in the same format; see its README.
 
 ## Model policy
 

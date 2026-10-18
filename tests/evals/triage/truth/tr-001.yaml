@@ -1,0 +1,5 @@
+id: tr-001
+category: code-regression
+why: The diff changes rounding to DOWN; the TSD requires half-up.
+tags:
+- clearing

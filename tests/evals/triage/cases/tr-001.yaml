@@ -1,0 +1,29 @@
+id: tr-001
+case:
+  id: SNX-REG-0101
+  name: Fee rounds half-up on 1249.995
+  suite: regression
+  status: failed
+  failure:
+    type: assertion
+    message: expected fee=1250.00 got 1249.99
+    trace: ''
+  correlation:
+    rrn: '629014773301'
+  tags:
+  - clearing
+logs:
+- 2026-10-16T10:02:01+05:30 INFO  FeeCalculator rrn=629014773301 base=1249.995 mode=DOWN fee=1249.99
+diff: |
+  --- a/clearing/FeeCalculator.java
+  +++ b/clearing/FeeCalculator.java
+  @@ -41,7 +41,7 @@ public BigDecimal fee(BigDecimal base) {
+  -        return base.setScale(2, RoundingMode.HALF_UP);
+  +        return base.setScale(2, RoundingMode.DOWN);
+tsd: |
+  SNX-1840 §3.2: Fees are rounded half-up to two decimals.
+product: |
+  SettleNxt clears and settles card transactions. Modules: clearing (fee calculation, batch totals),
+  dispute (chargebacks, reversals), iso (ISO 8583 packing, DE48 validation, response codes),
+  reporting (settlement reports), refund (refund API). Known flaky area: reporting export timing.
+  Simulators: sim-rupay (issuer), sim-acq (acquirer). Logs carry rrn, stan and batchId.

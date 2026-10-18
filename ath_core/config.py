@@ -38,7 +38,12 @@ class AgentRunnerConfig(_Model):
     """
     command: list[str] = Field(min_length=1)
     prompt_via: Literal["arg", "stdin", "file"] = Field("arg", alias="promptVia")
-    timeout_sec: int = Field(300, alias="timeoutSec", ge=10, le=3600)
+    timeout_sec: int = Field(300, alias="timeoutSec", ge=1, le=3600)
+    idle_timeout_sec: int = Field(0, alias="idleTimeoutSec", ge=0, le=3600)  # 0 = off; needs a CLI that streams
+    # Session control: ATH picks a session id ({session_id}) so a timed-out session can be resumed.
+    session_args: list[str] = Field(default_factory=list, alias="sessionArgs")  # first attempt, e.g. [--session-id, "{session_id}"]
+    resume_args: list[str] = Field(default_factory=list, alias="resumeArgs")    # resumes, e.g. [-r, "{session_id}"]
+    timeout_resumes: int = Field(0, alias="timeoutResumes", ge=0, le=5)
     pass_env: list[str] = Field(default_factory=list, alias="passEnv")
     set_env: dict[str, str] = Field(default_factory=dict, alias="setEnv")  # fixed values, e.g. AINXT_MAX_RETRIES
     voters: int = Field(3, ge=1, le=5)
@@ -60,6 +65,8 @@ class AgentRunnerConfig(_Model):
         auto_approve = [f for f in AUTO_APPROVE_FLAGS if any(f in arg for arg in self.command)]
         if auto_approve:
             raise ValueError(f"agent CLI must not auto-approve tool calls; remove {auto_approve} from command")
+        if self.timeout_resumes and not any("{session_id}" in a for a in self.resume_args):
+            raise ValueError("timeoutResumes needs resumeArgs with a {session_id} placeholder")
         if self.min_families > self.voters:
             raise ValueError(f"minFamilies ({self.min_families}) cannot exceed voters ({self.voters})")
         if self.prompt_via == "arg" and "{prompt}" not in joined:

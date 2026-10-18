@@ -1,0 +1,30 @@
+id: tr-010
+case:
+  id: SNX-REG-0110
+  name: RuPay debit BIN routes to domestic switch
+  suite: regression
+  status: failed
+  failure:
+    type: assertion
+    message: expected route=DOMESTIC got route=UNKNOWN
+    trace: ''
+  correlation:
+    rrn: '629014773310'
+  tags:
+  - routing
+logs:
+- 2026-10-16T10:10:02+05:30 WARN  BinLookupService rrn=629014773310 BIN lookup miss for 652150
+- 2026-10-16T10:10:02+05:30 INFO  RoutingService fallback route=UNKNOWN
+diff: |
+  --- a/portal/src/RefundForm.jsx
+  +++ b/portal/src/RefundForm.jsx
+  @@ -40,1 +40,1 @@
+  -  <label>Amount</label>
+  +  <label>Refund amount</label>
+tsd: |
+  SNX-1895: Portal label wording.
+product: |
+  SettleNxt clears and settles card transactions. Modules: clearing (fee calculation, batch totals),
+  dispute (chargebacks, reversals), iso (ISO 8583 packing, DE48 validation, response codes),
+  reporting (settlement reports), refund (refund API). Known flaky area: reporting export timing.
+  Simulators: sim-rupay (issuer), sim-acq (acquirer). Logs carry rrn, stan and batchId.

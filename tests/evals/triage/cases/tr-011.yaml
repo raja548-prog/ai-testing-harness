@@ -1,0 +1,30 @@
+id: tr-011
+case:
+  id: SNX-REG-0111
+  name: Purchase with valid card is approved
+  suite: smoke
+  status: failed
+  failure:
+    type: assertion
+    message: expected DE39=00 got DE39=54
+    trace: ''
+  correlation:
+    rrn: '629014773311'
+  tags:
+  - iso
+logs:
+- 2026-10-16T10:11:07+05:30 INFO  sim-rupay rrn=629014773311 card 4111111111111111 expiry 2025-12 -> 54 expired
+  card
+diff: |
+  --- a/reporting/DailySummary.java
+  +++ b/reporting/DailySummary.java
+  @@ -14,1 +14,1 @@
+  -    LOG.info("summary done");
+  +    LOG.info("daily summary done");
+tsd: |
+  SNX-1897: Clearer log message for the daily summary.
+product: |
+  SettleNxt clears and settles card transactions. Modules: clearing (fee calculation, batch totals),
+  dispute (chargebacks, reversals), iso (ISO 8583 packing, DE48 validation, response codes),
+  reporting (settlement reports), refund (refund API). Known flaky area: reporting export timing.
+  Simulators: sim-rupay (issuer), sim-acq (acquirer). Logs carry rrn, stan and batchId.

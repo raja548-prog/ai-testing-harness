@@ -1,0 +1,29 @@
+id: tr-005
+case:
+  id: SNX-REG-0105
+  name: DE48 with 37-byte additional data is accepted
+  suite: smoke
+  status: failed
+  failure:
+    type: assertion
+    message: expected ACCEPTED got REJECTED
+    trace: ''
+  correlation:
+    stan: '004520'
+  tags:
+  - iso
+logs:
+- '2026-10-16T10:06:03+05:30 WARN  De48Validator stan=004520 DE48 rejected: length 37 > 36'
+diff: |
+  --- a/iso/De48Validator.java
+  +++ b/iso/De48Validator.java
+  @@ -18,7 +18,7 @@ boolean valid(byte[] de48) {
+  -        return de48.length <= 99;
+  +        return de48.length <= 36;
+tsd: |
+  SNX-1875: DE48 additional data may be up to 99 bytes.
+product: |
+  SettleNxt clears and settles card transactions. Modules: clearing (fee calculation, batch totals),
+  dispute (chargebacks, reversals), iso (ISO 8583 packing, DE48 validation, response codes),
+  reporting (settlement reports), refund (refund API). Known flaky area: reporting export timing.
+  Simulators: sim-rupay (issuer), sim-acq (acquirer). Logs carry rrn, stan and batchId.

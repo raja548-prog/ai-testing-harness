@@ -1,0 +1,6 @@
+id: tr-004
+category: code-regression
+why: Off-by-one in the loop drops the last transaction; the slow-connection warnings are a distraction.
+tags:
+- clearing
+- misleading-log

@@ -1,0 +1,6 @@
+id: tr-011
+category: test-data
+why: The scenario's test card expired in December 2025; the diff is a log message.
+tags:
+- iso
+- looks-like-regression

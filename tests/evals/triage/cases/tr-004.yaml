@@ -1,0 +1,31 @@
+id: tr-004
+case:
+  id: SNX-REG-0104
+  name: Batch total counts every transaction
+  suite: regression
+  status: failed
+  failure:
+    type: assertion
+    message: expected batchCount=120 got 119
+    trace: ''
+  correlation:
+    batchId: B20261016-03
+  tags:
+  - clearing
+logs:
+- 2026-10-16T10:05:00+05:30 WARN  SimClient connection to sim-rupay slow (2300 ms), retrying
+- 2026-10-16T10:05:02+05:30 WARN  SimClient connection to sim-rupay slow (2100 ms), retrying
+- 2026-10-16T10:05:09+05:30 INFO  BatchCloser batchId=B20261016-03 closed count=119 total=148200.00
+diff: |
+  --- a/clearing/BatchCloser.java
+  +++ b/clearing/BatchCloser.java
+  @@ -30,7 +30,7 @@ int count(List<Txn> txns) {
+  -        for (int i = 0; i < txns.size(); i++) {
+  +        for (int i = 0; i < txns.size() - 1; i++) {
+tsd: |
+  SNX-1871: Batch closing logs the closing duration.
+product: |
+  SettleNxt clears and settles card transactions. Modules: clearing (fee calculation, batch totals),
+  dispute (chargebacks, reversals), iso (ISO 8583 packing, DE48 validation, response codes),
+  reporting (settlement reports), refund (refund API). Known flaky area: reporting export timing.
+  Simulators: sim-rupay (issuer), sim-acq (acquirer). Logs carry rrn, stan and batchId.

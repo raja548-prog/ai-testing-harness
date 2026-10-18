@@ -1,0 +1,21 @@
+id: tr-014
+case:
+  id: SNX-REG-0114
+  name: Dispute is persisted
+  suite: regression
+  status: failed
+  failure:
+    type: error
+    message: 'org.postgresql.util.PSQLException: FATAL: remaining connection slots are reserved'
+    trace: ''
+  tags:
+  - dispute
+logs:
+- 2026-10-16T10:14:03+05:30 ERROR HikariPool-1 connection is not available, request timed out after 30000ms
+diff: ''
+tsd: ''
+product: |
+  SettleNxt clears and settles card transactions. Modules: clearing (fee calculation, batch totals),
+  dispute (chargebacks, reversals), iso (ISO 8583 packing, DE48 validation, response codes),
+  reporting (settlement reports), refund (refund API). Known flaky area: reporting export timing.
+  Simulators: sim-rupay (issuer), sim-acq (acquirer). Logs carry rrn, stan and batchId.

@@ -11,11 +11,16 @@ It must not push code or call Jenkins, Jira or UAT itself: side effects go throu
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import tempfile
+import threading
+import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -121,9 +126,57 @@ def extract_json(text: str, schema: dict[str, str]) -> dict[str, Any]:
     return found
 
 
+CONTINUE_PROMPT = ("Continue from where you stopped and finish now. Respond with exactly one JSON object "
+                   "with these keys and value rules, and nothing else:\n{schema}\n")
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Stop the CLI and everything it started (tool shells, subagents), not just the parent."""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)  # the CLI leads its own process group (start_new_session)
+        except (ProcessLookupError, PermissionError):
+            return
+        try:
+            proc.wait(timeout=5)
+            if sig == signal.SIGTERM:
+                os.killpg(proc.pid, signal.SIGKILL)  # children that ignored SIGTERM or outlived the parent
+        except subprocess.TimeoutExpired:
+            continue
+        except (ProcessLookupError, PermissionError):
+            return
+        return
+
+
+@dataclass
+class _Attempt:
+    stdout: str
+    stderr: str
+    returncode: int | None
+    stopped: str = ""  # "timeout" | "idle" when ATH killed the session
+
+
 class CliAgentRunner:
+    """Runs one stage call as a headless CLI session.
+
+    - timeoutSec caps each attempt; idleTimeoutSec (0 = off) stops a session that prints nothing for
+      that long. Either way the whole process tree is killed.
+    - With sessionArgs/resumeArgs, ATH picks the session id up front and, after a timeout, resumes the
+      same session (context kept) up to timeoutResumes times with a short "finish now" prompt.
+    - `last_call` records the audit facts of the latest call: model, session, attempts, elapsed time,
+      exit code, and SHA-256 of the prompt and of the raw response (never their text).
+    """
+
     def __init__(self, cfg: AgentRunnerConfig):
         self.cfg = cfg
+        self.last_call: dict[str, Any] = {}
 
     def _env(self) -> dict[str, str]:
         # Only what the CLI needs to start and reach the model gateway; no harness secrets.
@@ -132,29 +185,95 @@ class CliAgentRunner:
 
     def run(self, skill: Skill, data: dict[str, str], model: str = "") -> dict[str, Any]:
         prompt = build_prompt(skill, data)
+        session_id = str(uuid.uuid4()) if (self.cfg.session_args or self.cfg.resume_args) else ""
+        started = time.monotonic()
+        call: dict[str, Any] = {"model": model, "session_id": session_id, "prompt_sha256": _sha256(prompt)}
+        self.last_call = call
+        att = self._attempt(prompt, model, session_id, resume=False)
+        resumes = 0
+        while att.stopped and session_id and resumes < self.cfg.timeout_resumes:
+            resumes += 1
+            att = self._attempt(CONTINUE_PROMPT.format(schema=json.dumps(skill.output_schema)), model,
+                                session_id, resume=True)
+        call.update(attempts=1 + resumes, elapsed_s=round(time.monotonic() - started, 2),
+                    exit_code=att.returncode, stopped=att.stopped or None, response_sha256=_sha256(att.stdout))
+        if att.stopped:
+            limit = self.cfg.timeout_sec if att.stopped == "timeout" else self.cfg.idle_timeout_sec
+            what = "timed out" if att.stopped == "timeout" else "printed nothing"
+            raise AgentError(f"agent CLI {what} for {limit}s and was stopped"
+                             + (f" after {resumes} resume(s)" if resumes else ""))
+        if att.returncode != 0:
+            env = _envelope(att.stdout) or {}
+            detail = env.get("message") if env.get("type") == "error" else att.stderr.strip()[-300:]
+            raise AgentError(f"agent CLI exited with {att.returncode}: {detail}")
+        return extract_json(att.stdout, skill.output_schema)
+
+    def _command(self, prompt: str, prompt_file: Path, workdir: str, model: str, session_id: str,
+                 resume: bool) -> list[str]:
+        values = {"{model}": model, "{workdir}": workdir, "{prompt_file}": str(prompt_file),
+                  "{session_id}": session_id}
+        extra = (self.cfg.resume_args if resume else self.cfg.session_args) if session_id else []
+        cmd = []
+        for arg in [*self.cfg.command, *extra]:
+            for k, v in values.items():
+                arg = arg.replace(k, v)
+            cmd.append(arg.replace("{prompt}", prompt) if self.cfg.prompt_via == "arg" else arg)
+        return cmd
+
+    def _attempt(self, prompt: str, model: str, session_id: str, resume: bool) -> _Attempt:
         with tempfile.TemporaryDirectory(prefix="ath-agent-") as workdir:
             prompt_file = Path(workdir) / "prompt.md"
             if self.cfg.prompt_via == "file":
                 prompt_file.write_text(prompt, encoding="utf-8")
-            values = {"{model}": model, "{workdir}": workdir, "{prompt_file}": str(prompt_file)}
-            cmd = []
-            for arg in self.cfg.command:
-                for k, v in values.items():
-                    arg = arg.replace(k, v)
-                cmd.append(arg.replace("{prompt}", prompt) if self.cfg.prompt_via == "arg" else arg)
+            cmd = self._command(prompt, prompt_file, workdir, model, session_id, resume)
+            group = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+                     else {"start_new_session": True})
             try:
-                proc = subprocess.run(cmd, input=prompt if self.cfg.prompt_via == "stdin" else None,
-                                      capture_output=True, text=True, timeout=self.cfg.timeout_sec,
-                                      cwd=workdir, env=self._env())
+                proc = subprocess.Popen(
+                    cmd, stdin=subprocess.PIPE if self.cfg.prompt_via == "stdin" else subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                    errors="replace", cwd=workdir, env=self._env(), **group)
             except FileNotFoundError:
                 raise AgentError(f"agent CLI {cmd[0]!r} not found on PATH")
-            except subprocess.TimeoutExpired:
-                raise AgentError(f"agent CLI timed out after {self.cfg.timeout_sec}s")
-        if proc.returncode != 0:
-            env = _envelope(proc.stdout) or {}
-            detail = env.get("message") if env.get("type") == "error" else proc.stderr.strip()[-300:]
-            raise AgentError(f"agent CLI exited with {proc.returncode}: {detail}")
-        return extract_json(proc.stdout, skill.output_schema)
+            out: list[str] = []
+            err: list[str] = []
+            last = [time.monotonic()]
+
+            def pump(stream, buf: list[str]) -> None:
+                for line in stream:
+                    buf.append(line)
+                    last[0] = time.monotonic()
+
+            readers = [threading.Thread(target=pump, args=(proc.stdout, out), daemon=True),
+                       threading.Thread(target=pump, args=(proc.stderr, err), daemon=True)]
+            for t in readers:
+                t.start()
+            if self.cfg.prompt_via == "stdin":
+                try:
+                    proc.stdin.write(prompt)
+                    proc.stdin.close()
+                except BrokenPipeError:
+                    pass
+            start, stopped = time.monotonic(), ""
+            while proc.poll() is None:
+                now = time.monotonic()
+                if now - start >= self.cfg.timeout_sec:
+                    stopped = "timeout"
+                elif self.cfg.idle_timeout_sec and now - last[0] >= self.cfg.idle_timeout_sec:
+                    stopped = "idle"
+                if stopped:
+                    _kill_tree(proc)
+                    break
+                time.sleep(0.05)
+            if not stopped and os.name != "nt":
+                try:  # tools the CLI started and left running must not outlive the session
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            proc.wait()
+            for t in readers:
+                t.join(timeout=5)
+        return _Attempt("".join(out), "".join(err), proc.returncode, stopped)
 
 
 # A quote shorter than this proves little (e.g. "0.00" or a test id appears in many places).
@@ -187,6 +306,7 @@ class CliTriageAgent:
     def __init__(self, name: str, runner: CliAgentRunner, skill: Skill, model: str, masker: Masker):
         self.name, self.runner, self.skill, self.model, self.masker = name, runner, skill, model, masker
         self.last_evidence: str = ""
+        self.last_call: dict[str, Any] = {}  # audit record of this voter's latest CLI call
 
     def classify(self, case: ATRFCase, evidence: dict[str, Any]) -> Vote:
         data = {
@@ -198,7 +318,10 @@ class CliTriageAgent:
         }
         # Inputs are masked upstream; mask again before anything leaves the harness.
         sent = {k: self.masker.mask(v) for k, v in data.items()}
-        out = self.runner.run(self.skill, sent, self.model)
+        try:
+            out = self.runner.run(self.skill, sent, self.model)
+        finally:  # voters share one runner; keep our own copy of the call record, failed calls too
+            self.last_call = dict(self.runner.last_call)
         category = TriageCategory(out["category"])
         self.last_evidence = str(out.get("evidence", ""))
         quote = self.masker.mask(str(out.get("quote") or ""))

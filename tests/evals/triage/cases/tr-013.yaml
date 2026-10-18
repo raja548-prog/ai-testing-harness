@@ -1,0 +1,27 @@
+id: tr-013
+case:
+  id: SNX-REG-0113
+  name: Authorisation round trip
+  suite: smoke
+  status: failed
+  failure:
+    type: error
+    message: 'java.net.ConnectException: Connection refused (sim-rupay.uat1.internal:8583)'
+    trace: ''
+  tags:
+  - iso
+logs:
+- '2026-10-16T10:13:00+05:30 ERROR IssuerConnector cannot connect to sim-rupay.uat1.internal:8583: Connection refused'
+diff: |
+  --- a/reporting/ReportWriter.java
+  +++ b/reporting/ReportWriter.java
+  @@ -60,1 +60,1 @@
+  -    int pageSize = 500;
+  +    int pageSize = 1000;
+tsd: |
+  SNX-1899: Larger report pages.
+product: |
+  SettleNxt clears and settles card transactions. Modules: clearing (fee calculation, batch totals),
+  dispute (chargebacks, reversals), iso (ISO 8583 packing, DE48 validation, response codes),
+  reporting (settlement reports), refund (refund API). Known flaky area: reporting export timing.
+  Simulators: sim-rupay (issuer), sim-acq (acquirer). Logs carry rrn, stan and batchId.

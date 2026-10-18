@@ -1,0 +1,27 @@
+id: tr-008
+case:
+  id: SNX-REG-0108
+  name: Refund status response matches schema
+  suite: smoke
+  status: failed
+  failure:
+    type: assertion
+    message: 'schema validation failed: unexpected property ''reasonCode'''
+    trace: ''
+  tags:
+  - refund
+logs:
+- 2026-10-16T10:09:00+05:30 INFO  RefundController GET /refunds/RF-881 200 body has reasonCode=R07
+diff: |
+  --- a/api/RefundStatus.java
+  +++ b/api/RefundStatus.java
+  @@ -8,4 +8,5 @@ public record RefundStatus(
+       String status,
+  +    String reasonCode,
+tsd: |
+  SNX-1882: The refund status API returns a reasonCode for rejected refunds.
+product: |
+  SettleNxt clears and settles card transactions. Modules: clearing (fee calculation, batch totals),
+  dispute (chargebacks, reversals), iso (ISO 8583 packing, DE48 validation, response codes),
+  reporting (settlement reports), refund (refund API). Known flaky area: reporting export timing.
+  Simulators: sim-rupay (issuer), sim-acq (acquirer). Logs carry rrn, stan and batchId.

@@ -1,0 +1,33 @@
+id: tr-002
+case:
+  id: SNX-REG-0102
+  name: Reversal without original transaction is rejected
+  suite: regression
+  status: failed
+  failure:
+    type: error
+    message: 'java.lang.NullPointerException: Cannot invoke "Txn.getAmount()" because "original" is null'
+    trace: "java.lang.NullPointerException\n\tat snx.dispute.ReversalService.reverse(ReversalService.java:88)"
+  correlation:
+    rrn: '629014773302'
+  tags:
+  - dispute
+logs:
+- 2026-10-16T10:03:05+05:30 ERROR ReversalService rrn=629014773302 original transaction not found
+- 2026-10-16T10:03:05+05:30 ERROR java.lang.NullPointerException at ReversalService.java:88
+diff: |
+  --- a/dispute/ReversalService.java
+  +++ b/dispute/ReversalService.java
+  @@ -84,9 +84,6 @@ public Result reverse(Request r) {
+           Txn original = repo.findByRrn(r.originalRrn());
+  -        if (original == null) {
+  -            return Result.rejected(ResponseCode.NO_ORIGINAL);
+  -        }
+           return settle(original.getAmount().negate());
+tsd: |
+  SNX-1851: Reversals must reference an existing original transaction.
+product: |
+  SettleNxt clears and settles card transactions. Modules: clearing (fee calculation, batch totals),
+  dispute (chargebacks, reversals), iso (ISO 8583 packing, DE48 validation, response codes),
+  reporting (settlement reports), refund (refund API). Known flaky area: reporting export timing.
+  Simulators: sim-rupay (issuer), sim-acq (acquirer). Logs carry rrn, stan and batchId.

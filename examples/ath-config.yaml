@@ -30,7 +30,13 @@ agentRunner:
   # Never add --yolo or --permission-mode bypassPermissions: ATH refuses such a command.
   # Without them, headless ainxt cancels any tool call that would need approval.
   promptVia: file
-  timeoutSec: 300
+  timeoutSec: 300                   # per attempt; on timeout the CLI and all its child processes are killed
+  idleTimeoutSec: 0                 # 0 = off. `--output-format json` prints only at the end, so keep 0;
+                                    # with streaming-json, e.g. 120 stops a session that hangs silently
+  # ATH chooses the session id, so a timed-out session can be resumed with its context kept.
+  sessionArgs: [--session-id, "{session_id}"]
+  resumeArgs: [-r, "{session_id}"]  # resumed with a short "finish now and answer in JSON" prompt
+  timeoutResumes: 1
   voters: 3                         # independent T7 triage sessions; 2 of 3 must agree
   # Voters from one model family make the same mistakes. List models from different families
   # (names from `ainxt models`), map them to families, then raise minFamilies to 2.

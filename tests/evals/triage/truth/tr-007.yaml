@@ -1,0 +1,5 @@
+id: tr-007
+category: test-outdated
+why: The column order change is what the TSD asks for.
+tags:
+- reporting

@@ -1,0 +1,24 @@
+id: tr-016
+case:
+  id: SNX-REG-0116
+  name: Transactions after 23:00 IST go to next cycle
+  suite: regression
+  status: failed
+  failure:
+    type: assertion
+    message: expected cycle=2026-10-17 got cycle=2026-10-16
+    trace: ''
+  correlation:
+    batchId: B20261016-09
+  tags:
+  - clearing
+logs:
+- 2026-10-16T10:16:00+05:30 INFO  CycleResolver batchId=B20261016-09 cutoff evaluated with zone UTC (expected Asia/Kolkata)
+diff: ''
+tsd: |
+  SNX-1700: Cut-off is 23:00 Asia/Kolkata.
+product: |
+  SettleNxt clears and settles card transactions. Modules: clearing (fee calculation, batch totals),
+  dispute (chargebacks, reversals), iso (ISO 8583 packing, DE48 validation, response codes),
+  reporting (settlement reports), refund (refund API). Known flaky area: reporting export timing.
+  Simulators: sim-rupay (issuer), sim-acq (acquirer). Logs carry rrn, stan and batchId.

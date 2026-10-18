@@ -1,0 +1,6 @@
+id: tr-016
+category: environment
+why: The UAT host runs with the UTC zone, a config drift unrelated to the change.
+tags:
+- clearing
+- config-drift

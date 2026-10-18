@@ -1,0 +1,5 @@
+id: tr-005
+category: code-regression
+why: The diff tightened the DE48 limit to 36; the TSD allows 99.
+tags:
+- iso

@@ -1,0 +1,5 @@
+id: tr-008
+category: test-outdated
+why: reasonCode is a new field the TSD requires; the strict schema in the test predates it.
+tags:
+- refund

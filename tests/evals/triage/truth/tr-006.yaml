@@ -1,0 +1,5 @@
+id: tr-006
+category: test-outdated
+why: The window was extended on purpose; the test still expects the 30-day rule.
+tags:
+- refund

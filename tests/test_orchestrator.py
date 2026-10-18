@@ -76,13 +76,29 @@ def test_resume_does_not_redo_finished_stages(orch):
     assert FakePipeline.triggered == triggered  # no second deploy
 
 
-def test_assist_mode_parks_at_a_gate(tmp_path):
+class _Regression:
+    def __init__(self, name):
+        self.name = name
+
+    def classify(self, case, evidence):
+        return TriageCategory.CODE_REGRESSION
+
+
+def test_assist_mode_parks_at_the_redeploy_gate_for_a_regression(tmp_path):
     profile = load_profile(LOCAL_PROFILE)
-    o = Orchestrator(profile, StateStore(":memory:"), report_dir=tmp_path)
+    o = Orchestrator(profile, StateStore(":memory:"), report_dir=tmp_path,
+                     agents=[_Regression(n) for n in "abc"])
     m = o.start(_ctx(mode=RunMode.ASSIST))
     assert m.status == RunStatus.WAITING_GATE
     assert m.stages[Stage.T10_REMEDIATE].status == StageStatus.WAITING_GATE
     assert FakeLock.held == {"uat1": "r1"}  # hold kept across the gate for the fix loop
+
+
+def test_assist_mode_without_regressions_needs_no_gate(tmp_path):
+    o = Orchestrator(load_profile(LOCAL_PROFILE), StateStore(":memory:"), report_dir=tmp_path)
+    m = o.start(_ctx(mode=RunMode.ASSIST))  # no agents: the failure is `unknown`, nothing to fix
+    assert m.status == RunStatus.SUCCEEDED
+    assert m.stages[Stage.T10_REMEDIATE].output["reason"] == "no code-regression failures to remediate"
 
 
 def test_log_source_fallback_is_recorded(orch):

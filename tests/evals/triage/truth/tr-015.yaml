@@ -1,0 +1,5 @@
+id: tr-015
+category: environment
+why: Kafka in UAT is unreachable; the diff only edits a comment.
+tags:
+- events

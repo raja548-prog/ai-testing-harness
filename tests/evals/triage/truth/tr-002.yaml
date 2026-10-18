@@ -1,0 +1,5 @@
+id: tr-002
+category: code-regression
+why: The diff removed the null check, so a missing original now throws instead of rejecting.
+tags:
+- dispute

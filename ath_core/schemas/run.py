@@ -35,6 +35,7 @@ class StageStatus(str, Enum):
     SKIPPED = "skipped"
     WAITING_GATE = "waiting-gate"
     FAILED = "failed"
+    REJECTED = "rejected"
 
 
 class RunStatus(str, Enum):
@@ -44,6 +45,7 @@ class RunStatus(str, Enum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    REJECTED = "rejected"  # a human rejected a gate; the run stops with its artifacts kept
 
 
 def utcnow() -> datetime:
@@ -74,6 +76,16 @@ class StageResult(BaseModel):
     error: str | None = None
 
 
+class GateDecision(BaseModel):
+    """A human decision at a HITL gate (T3 test changes, T10 redeploy of a fix, T11 verdict)."""
+    stage: Stage
+    decision: str  # approved | rejected
+    by: str
+    groups: list[str] = Field(default_factory=list)
+    comment: str = ""
+    at: datetime = Field(default_factory=utcnow)
+
+
 class RunManifest(BaseModel):
     """Audit record of a run: pinned versions, inputs, stage outcomes, cost."""
     context: RunContext
@@ -83,6 +95,9 @@ class RunManifest(BaseModel):
     status: RunStatus = RunStatus.QUEUED
     stages: dict[Stage, StageResult] = Field(default_factory=dict)
     log_sources_used: list[str] = Field(default_factory=list)
+    gates: list[GateDecision] = Field(default_factory=list)
+    profile_ref: str | None = None  # profile file the run started with (API approvals reload it)
+    inputs: dict[str, str] = Field(default_factory=dict)  # context input -> sha256 (diff, tsd)
     est_tokens: int = 0
     actual_tokens: int = 0
     created_at: datetime = Field(default_factory=utcnow)
