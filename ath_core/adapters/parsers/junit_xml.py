@@ -10,6 +10,18 @@ from ath_core.schemas.atrf import ATRFCase, ATRFFailure, ATRFRun, CaseStatus
 CORRELATION_KEYS = ("rrn", "stan", "batchId", "fileName", "traceId")
 
 
+def correlation_from_text(text: str) -> dict[str, str]:
+    """Correlation keys from lines of test output that start with `key=value`."""
+    found: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        for key in CORRELATION_KEYS:
+            prefix = f"{key}="
+            if line.startswith(prefix) and line[len(prefix):].split():
+                found.setdefault(key, line[len(prefix):].split()[0])
+    return found
+
+
 @registry.register("parser", "junit-xml")
 class JUnitXmlParser(ResultParser):
     format = "junit-xml"
@@ -49,12 +61,8 @@ class JUnitXmlParser(ResultParser):
             for p in props.findall("property"):
                 if p.get("name") in CORRELATION_KEYS and p.get("value"):
                     correlation[p.get("name")] = p.get("value")
-        out = tc.findtext("system-out") or ""
-        for line in out.splitlines():
-            for key in CORRELATION_KEYS:
-                prefix = f"{key}="
-                if line.strip().startswith(prefix):
-                    correlation.setdefault(key, line.strip()[len(prefix):].split()[0])
+        for key, value in correlation_from_text(tc.findtext("system-out") or "").items():
+            correlation.setdefault(key, value)
         tags = [t.strip() for t in (tc.get("tags") or "").split(",") if t.strip()]
         return ATRFCase(
             id=case_id, name=masker.mask(name), suite=suite, status=status,

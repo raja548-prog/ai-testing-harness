@@ -10,14 +10,25 @@ repos:
 build:  { adapter: <gitlab-pipeline|jenkins-job>, project: <ci-project> }
 deploy:
   adapter: <jenkins-job|gitlab-pipeline>
-  job: <cd-job>
+  # jenkins-job: your own Jenkins. Secrets are env:NAME references, never values.
+  baseUrl: <https://jenkins.your-dept.internal>
+  job: <cd-job>                                  # folders as folder/job
+  trigger: webhook                               # webhook (Generic Webhook Trigger) | api
+  webhookTokenRef: env:<PRODUCT>_JENKINS_WEBHOOK_TOKEN
+  user: <jenkins-user-with-read-access>
+  tokenRef: env:<PRODUCT>_JENKINS_API_TOKEN
   params: { COMMIT_ID: "${commit}", ENV: <uat-env> }
   healthCheck: { url: <health-url>, expect: 200, timeoutSec: 600 }
 
 suites:
   - id: smoke
-    executor: { adapter: <jenkins-job|test-server-api|simulator>, job: <smoke-job> }
-    results:  { format: <junit-xml|allure-json|cucumber-json|custom>, path: <glob> }
+    executor:
+      adapter: <jenkins-job|test-server-api|simulator>
+      # jenkins-job: same baseUrl/trigger/webhookTokenRef/user/tokenRef as deploy, plus:
+      job: <smoke-job>
+      params: { COMMIT_ID: "${commit}", ENV: "${env}" }
+      collect: test-report                       # test-report | artifacts (then set artifacts: <glob>)
+    results:  { format: <jenkins-test-report|junit-xml|allure-json|cucumber-json|custom> }
     maxDurationMin: 15
 
 selection:

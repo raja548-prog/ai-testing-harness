@@ -1,4 +1,5 @@
-# Production-shaped profile for SettleNxt (adapters to be wired to real Jenkins/GitLab).
+# Production-shaped profile for SettleNxt. Jenkins is wired; the GitLab build adapter is a skeleton.
+# Secrets are references only: export SNX_JENKINS_API_TOKEN and SNX_JENKINS_WEBHOOK_TOKEN.
 apiVersion: ainxt.io/test-profile/v1
 product: settlenxt
 owners: [settlement-dept]   # any member of the owning department
@@ -12,18 +13,40 @@ build:            # CI: build and push to Nexus
   artifactRepo: nexus://releases/settlenxt
 deploy:           # CD: pull artifact by commit id
   adapter: jenkins-job
+  baseUrl: https://jenkins.settle.internal
   job: settlenxt-cd-uat
+  trigger: webhook                              # Generic Webhook Trigger, like Git pushes
+  webhookTokenRef: env:SNX_JENKINS_WEBHOOK_TOKEN
+  user: ath-reader                              # read access, to follow the build
+  tokenRef: env:SNX_JENKINS_API_TOKEN
   params: { COMMIT_ID: "${commit}", ENV: uat1 }
   healthCheck: { url: "https://uat1.internal/settlenxt/health", expect: 200, timeoutSec: 600 }
 
 suites:
   - id: smoke
-    executor: { adapter: jenkins-job, job: settlenxt-smoke }
-    results:  { format: junit-xml, path: "target/surefire-reports/*.xml" }
+    executor:
+      adapter: jenkins-job
+      baseUrl: https://jenkins.settle.internal
+      job: settlenxt-smoke
+      webhookTokenRef: env:SNX_JENKINS_WEBHOOK_TOKEN
+      user: ath-reader
+      tokenRef: env:SNX_JENKINS_API_TOKEN
+      params: { COMMIT_ID: "${commit}", ENV: "${env}" }
+      collect: test-report                      # what the job's `junit` step published
+    results:  { format: jenkins-test-report }
     maxDurationMin: 15
   - id: regression
-    executor: { adapter: jenkins-job, job: settlenxt-regression }
-    results:  { format: junit-xml, path: "target/failsafe-reports/*.xml" }
+    executor:
+      adapter: jenkins-job
+      baseUrl: https://jenkins.settle.internal
+      job: settle/settlenxt-regression          # folder/job
+      webhookTokenRef: env:SNX_JENKINS_WEBHOOK_TOKEN
+      user: ath-reader
+      tokenRef: env:SNX_JENKINS_API_TOKEN
+      params: { COMMIT_ID: "${commit}", ENV: "${env}" }
+      collect: artifacts                        # archived JUnit XML keeps ids and correlation keys
+      artifacts: "target/failsafe-reports/*.xml"
+    results:  { format: junit-xml }
     maxDurationMin: 180
 
 selection:

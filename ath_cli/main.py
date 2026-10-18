@@ -32,21 +32,31 @@ def cmd_doctor(a: argparse.Namespace) -> int:
     if cmd_validate(a):
         return 1
     p = load_profile(a.profile)
-    checks: list[tuple[str, str, str]] = [
-        ("pipeline", p.build.adapter, "build"), ("pipeline", p.deploy.adapter, "deploy"),
+    checks: list[tuple[str, str, str, dict]] = [
+        ("pipeline", p.build.adapter, "build", p.build.params),
+        ("pipeline", p.deploy.adapter, "deploy", p.deploy.params),
     ]
-    checks += [("executor", s.executor.adapter, f"suite {s.id}") for s in p.suites]
-    checks += [("parser", s.results.parser or s.results.format, f"suite {s.id} results") for s in p.suites]
-    checks += [("logs", s.adapter, "log source") for s in p.logs.sources]
+    checks += [("executor", s.executor.adapter, f"suite {s.id}", s.executor.params) for s in p.suites]
+    checks += [("parser", s.results.parser or s.results.format, f"suite {s.id} results", {}) for s in p.suites]
+    checks += [("logs", s.adapter, "log source", s.params) for s in p.logs.sources]
     if p.policy.env_lock:
-        checks.append(("envlock", p.policy.env_lock.adapter, "env lock"))
+        checks.append(("envlock", p.policy.env_lock.adapter, "env lock", p.policy.env_lock.params))
     bad = 0
-    for kind, name, where in checks:
-        ok = name in registry.names(kind)
-        bad += not ok
-        print(f"  [{'ok' if ok else 'MISSING'}] {where}: {kind} adapter '{name}'")
+    for kind, name, where, params in checks:
+        if name not in registry.names(kind):
+            bad += 1
+            print(f"  [MISSING] {where}: {kind} adapter '{name}'")
+            continue
+        # Adapters may report configuration problems (missing params, unset secrets).
+        problems = []
+        if kind != "parser" and hasattr(registry.get(kind, name), "config_problems"):
+            problems = registry.create(kind, name, **params).config_problems()
+        bad += bool(problems)
+        print(f"  [{'ok' if not problems else 'CONFIG'}] {where}: {kind} adapter '{name}'")
+        for problem in problems:
+            print(f"      - {problem}")
     # TODO (platform): check the user's Git/Jira profile tokens and env reachability.
-    print("doctor: all adapters available" if not bad else f"doctor: {bad} adapter(s) missing")
+    print("doctor: all adapters available and configured" if not bad else f"doctor: {bad} adapter(s) missing or misconfigured")
     return 0 if not bad else 2
 
 

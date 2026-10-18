@@ -21,7 +21,7 @@ ainxt-ath/
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[server,dev]"
-pytest                                   # 29 tests, no network needed
+pytest                                   # 41 tests, no network needed
 
 ainxt-ath doctor examples/settlenxt/test-profile.local.yaml
 ainxt-ath run --profile examples/settlenxt/test-profile.local.yaml \
@@ -43,20 +43,21 @@ API: `ATH_PROFILES=examples/settlenxt uvicorn ath_server.api.app:app --reload`, 
 | Area | Status |
 | --- | --- |
 | Test Profile schema + cross-checks, `validate`, `doctor` | Done |
-| ATRF schema, JUnit XML parser with correlation keys | Done |
+| ATRF schema, JUnit XML and Jenkins test-report parsers with correlation keys | Done |
 | Masking (PAN with Luhn, track 2, CVV, PIN block, Aadhaar, mobile) | Done |
 | Orchestrator: stage plan per mode, checkpoints, resume, gates, env hold, structured events | Done (in-process) |
 | T2 rule-based selection, T4 deploy, T5 run + merge-base baseline cache, T6 normalize | Done |
 | T7 pre-checks (known failure, quarantine, pre-existing, flaky retry), voting + 2-of-3 quorum | Done; agents pluggable |
 | T9 Markdown report | Done; posting to MR/Jira is a TODO |
 | Log sources: log-api (HTTP), ssh (server-only, skeleton), fake | Partly |
-| Jenkins / GitLab adapters | Skeletons |
+| Jenkins adapter (webhook or API trigger, test-report or artifact results) | Done; tested against a mock Jenkins |
+| GitLab adapter | Skeleton |
 | T1 impact, T3 authoring, T10 remediation, T11 validation (LLM) | Stubs + skills drafted |
 
 ## Next steps
 
-1. **Wire real adapters** for the first pilot: Jenkins/GitLab trigger and poll, artifact download,
-   the department env-booking hold (`dept-env-booking`), and the UAT `log-api`.
+1. **Wire real adapters** for the first pilot: GitLab trigger and poll, the department env-booking
+   hold (`dept-env-booking`), and the UAT `log-api`.
 2. **Triage agents**: implement `TriageAgent.classify` against the AiNxt model gateway using
    `skills/t07-triage`, then build `tests/evals/` from real past failures and measure precision
    before enabling it.
@@ -64,6 +65,38 @@ API: `ATH_PROFILES=examples/settlenxt uvicorn ath_server.api.app:app --reload`, 
    broker for Git/Jira, and durable workflows (e.g. Temporal) wrapping the stage functions.
 4. **More parsers**: allure-json, testng, cucumber-json, and the simulator CSV format.
 5. **LLM stages**: T1 → T3 (behind its gate) → T10/T11 in `assist` mode.
+
+## Connecting your Jenkins
+
+Each product points ATH at its own Jenkins with `adapter: jenkins-job` (see
+[`examples/settlenxt/test-profile.yaml`](examples/settlenxt/test-profile.yaml) and the docstring in
+[`ath_core/adapters/pipeline/jenkins.py`](ath_core/adapters/pipeline/jenkins.py)).
+
+On the Jenkins side, for the CD job and each suite job:
+
+1. **Trigger.** Install the Generic Webhook Trigger plugin and give the job a token, the same way Git
+   pushes trigger it. Map the variables ATH sends in the JSON body with JSONPath, e.g.
+   `COMMIT_ID` ← `$.COMMIT_ID`, `ATH_RUN_ID` ← `$.ATH_RUN_ID`, `ATH_KEY` ← `$.ATH_KEY`.
+   Alternatively set `trigger: api` to use `buildWithParameters` instead.
+2. **Parameters.** Declare `ATH_RUN_ID` and `ATH_KEY` as string parameters, so a resumed ATH run can
+   find the build it already started instead of starting a second one.
+3. **Results.** Suite jobs publish JUnit results with a `junit` step (read through the test-report API,
+   `collect: test-report`, `results.format: jenkins-test-report`). If your tests carry ids, tags or
+   correlation keys in JUnit `<properties>`, archive the XML instead and use `collect: artifacts`
+   with `results.format: junit-xml`.
+4. **Read access.** Create a Jenkins user with read access to these jobs and an API token. A webhook
+   token can start a job but not read it, so ATH needs this in both trigger modes.
+
+Then export the tokens named in the profile and check:
+
+```bash
+export SNX_JENKINS_WEBHOOK_TOKEN=...   # the job's webhook token
+export SNX_JENKINS_API_TOKEN=...       # API token of the read user
+ainxt-ath doctor examples/settlenxt/test-profile.yaml
+```
+
+Profiles hold `env:NAME` references only, never the token; `vault:` references are reserved for the
+platform credential broker.
 
 ## Adding an adapter
 

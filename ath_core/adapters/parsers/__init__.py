@@ -1,1 +1,1 @@
-from . import junit_xml  # noqa: F401  (registers "junit-xml")
+from . import jenkins_test_report, junit_xml  # noqa: F401  (registers "jenkins-test-report", "junit-xml")
