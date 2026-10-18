@@ -3,6 +3,7 @@
 A product-agnostic, agentic testing harness for the AiNxt platform. One shared core runs
 an 11-stage pipeline (T1–T11); each product plugs in through a declarative **Test Profile**,
 a **product skill** and reusable **adapters**. Design: [`docs/design.md`](docs/design.md).
+**How to build, onboard a product and use ATH: [`docs/GUIDE.md`](docs/GUIDE.md).**
 
 ```
 ainxt-ath/
@@ -60,7 +61,7 @@ API: `ATH_PROFILES=examples/settlenxt uvicorn ath_server.api.app:app --reload`, 
 | Triage eval framework + 22 synthetic cases (`ainxt-ath eval`) | Done; real cases still needed |
 | Agent CLI process handling: tree kill, idle timeout, session resume, per-call audit events | Done |
 | HITL gates: `approve`/`reject` (CLI + API), separation of duties | Done; SSO groups and step-up still stubbed |
-| Triage context: diff + TSD excerpts, Requirement-Harness packages (hash-checked) | Done |
+| Triage context: diff + TSD excerpts | Done |
 | T9 Markdown report | Done; posting to MR/Jira is a TODO |
 | Log sources: log-api (HTTP), ssh (server-only, skeleton), fake | Partly |
 | Jenkins adapter (webhook or API trigger, test-report or artifact results) | Done; tested against a mock Jenkins |
@@ -139,14 +140,11 @@ Give triage the MR diff and the TSD, so voters can tell a regression from an int
 
 ```bash
 ainxt-ath run ... --diff mr.diff --tsd tsd.md
-ainxt-ath run ... --diff mr.diff --rh-package <rh-home>/packages/ER-0007    # Requirement-Harness package
 ```
 
 For each failing case ATH sends the changed files and TSD sections most related to it (deterministic word
-overlap, size-capped). From a Requirement-Harness package it reads the approved TSD projections and checks
-each file against the hash recorded at sign-off, refusing a TSD edited afterwards; section footers
-(`ⓘ R-3 · AC-7`) keep requirement ids for tracing. Both inputs are masked and stored with the run, and
-their hashes are recorded in the run manifest. Every voter call is logged as an `agent.call` event with
+overlap, size-capped). Both inputs are masked and stored with the run, and their hashes are recorded in
+the run manifest. Every voter call is logged as an `agent.call` event with
 the model, session, attempts, duration and SHA-256 of prompt and response (never their text).
 
 ## Triage evals
