@@ -167,12 +167,16 @@ class Orchestrator:
                     self.store.checkpoint(ctx.run_id, res)
                     self.store.event(ctx.run_id, stage.value, "gate.wait", gate=str(g))
                     return m
-                except AdapterError as e:
-                    res.status, res.error = StageStatus.FAILED, str(e)
+                except Exception as e:  # any error, not only AdapterError, must fail the run and free the env
+                    adapter = isinstance(e, AdapterError)
+                    # Masked: error text can quote raw results or logs.
+                    error = self.masker.mask(str(e) if adapter else f"{type(e).__name__}: {e}")
+                    res.status, res.error = StageStatus.FAILED, error
                     m.stages[stage] = res
                     m.status = RunStatus.FAILED
                     self.store.checkpoint(ctx.run_id, res)
-                    self.store.event(ctx.run_id, stage.value, "stage.failed", error=str(e), retryable=e.retryable)
+                    self.store.event(ctx.run_id, stage.value, "stage.failed", error=error,
+                                     retryable=e.retryable if adapter else False)
                     return m
                 res.finished_at = utcnow()
                 m.stages[stage] = res
@@ -181,6 +185,8 @@ class Orchestrator:
             m.status = RunStatus.SUCCEEDED
             return m
         finally:
+            if m.status == RunStatus.RUNNING:  # an error outside a stage function (store, resume) escaped
+                m.status = RunStatus.FAILED
             self.store.save_manifest(m)
             if m.status in (RunStatus.SUCCEEDED, RunStatus.FAILED):
                 self._release_env(ctx)

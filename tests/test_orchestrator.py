@@ -105,3 +105,30 @@ def test_log_source_fallback_is_recorded(orch):
     orch.start(_ctx())
     ev = [(k, d) for _, k, d in orch.store.events("r1") if k == "logsource.fallback"]
     assert ev and ev[0][1]["adapter"] == "log-api"
+
+
+def test_unexpected_stage_error_fails_the_run_and_frees_the_env(orch, monkeypatch):
+    def broken(ctx):
+        raise ValueError("bad time '1,234.5' for card 4111111111111111")
+    monkeypatch.setattr(orch, "t6_normalize", broken)
+    m = orch.start(_ctx())
+    assert m.status == RunStatus.FAILED
+    assert m.stages[Stage.T6_NORMALIZE].error == "ValueError: bad time '1,234.5' for card [PAN****1111]"
+    failed = [d for _, k, d in orch.store.events("r1") if k == "stage.failed"]
+    assert failed == [{"error": m.stages[Stage.T6_NORMALIZE].error, "retryable": False}]
+    assert orch.store.load_manifest("r1").status == RunStatus.FAILED
+    assert FakeLock.held == {}
+
+
+def test_error_outside_a_stage_still_fails_the_run_and_frees_the_env(orch, monkeypatch):
+    event = orch.store.event
+
+    def flaky_store(run_id, stage, kind, **detail):
+        if (stage, kind) == ("T5", "stage.done"):
+            raise RuntimeError("store unavailable")
+        event(run_id, stage, kind, **detail)
+    monkeypatch.setattr(orch.store, "event", flaky_store)
+    with pytest.raises(RuntimeError, match="store unavailable"):
+        orch.start(_ctx())
+    assert orch.store.load_manifest("r1").status == RunStatus.FAILED
+    assert FakeLock.held == {}
