@@ -40,9 +40,11 @@ class JUnitXmlParser(ResultParser):
         return ATRFRun(run_id=run_id, product=product, suite=suite, env=env, commit=commit, cases=cases)
 
     def _case(self, tc: ET.Element, suite: str, masker) -> ATRFCase:
-        classname = tc.get("classname", "")
-        name = tc.get("name", "unnamed")
-        case_id = tc.get("id") or (f"{classname}.{name}" if classname else name)
+        # Ids are masked like names: they reach ATRF, the report and events. Known failures and
+        # quarantine entries are masked the same way before they are compared with them.
+        classname = masker.mask(tc.get("classname", ""))
+        name = masker.mask(tc.get("name", "unnamed"))
+        case_id = masker.mask(tc.get("id") or "") or (f"{classname}.{name}" if classname else name)
         status, failure = CaseStatus.PASSED, None
         for tag, st in (("failure", CaseStatus.FAILED), ("error", CaseStatus.ERROR)):
             el = tc.find(tag)
@@ -65,7 +67,7 @@ class JUnitXmlParser(ResultParser):
             correlation.setdefault(key, value)
         tags = [t.strip() for t in (tc.get("tags") or "").split(",") if t.strip()]
         return ATRFCase(
-            id=case_id, name=masker.mask(name), suite=suite, status=status,
+            id=case_id, name=name, suite=suite, status=status,
             duration_ms=int(float(tc.get("time", "0") or 0) * 1000), tags=tags,
             failure=failure, correlation=correlation,
         )

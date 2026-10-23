@@ -11,6 +11,8 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from ath_core.masking import CATEGORIES as MASK_CATEGORIES
+
 SUPPORTED_API_VERSIONS = {"ainxt.io/test-profile/v1"}
 
 
@@ -79,7 +81,16 @@ class TestAuthoring(_Model):
 
 class LogsConfig(_Model):
     sources: list[AdapterRef] = Field(min_length=1)
-    masking: list[str] = Field(default_factory=lambda: ["pan", "cvv", "track2", "aadhaar", "mobile"])
+    masking: list[str] = Field(default_factory=lambda: list(MASK_CATEGORIES))
+
+    @field_validator("masking")
+    @classmethod
+    def _known_categories(cls, v: list[str]) -> list[str]:
+        # A typo or `PAN` must not silently switch masking off.
+        v = [c.strip().lower() for c in v]
+        if unknown := sorted(set(v) - set(MASK_CATEGORIES)):
+            raise ValueError(f"unknown masking categories {unknown}; known: {list(MASK_CATEGORIES)}")
+        return v
 
 
 class EnvLockConfig(AdapterRef):

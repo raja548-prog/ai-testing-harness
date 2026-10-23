@@ -42,3 +42,12 @@ def test_scripts_or_unknown_fields_are_rejected():
     data["policy"]["preRunScript"] = "rm -rf /"
     with pytest.raises(ValidationError):
         TestProfile.model_validate(data)
+
+
+def test_masking_categories_are_checked(tmp_path):
+    data = yaml.safe_load(LOCAL_PROFILE.read_text())
+    data["logs"]["masking"] = ["PAN", "cvv"]
+    assert TestProfile.model_validate(data).logs.masking == ["pan", "cvv"]
+    data["logs"]["masking"] = ["pan", "cvc"]
+    with pytest.raises(ValidationError, match="unknown masking categories"):
+        TestProfile.model_validate(data)

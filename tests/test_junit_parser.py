@@ -34,3 +34,12 @@ def test_correlation_keys_from_properties_and_stdout():
 def test_testsuites_root():
     run = _parse(FIXTURES / "mr001/regression/TEST-regression.xml")
     assert run.summary.total == 2
+
+
+def test_case_ids_are_masked():
+    xml = b'<testsuite><testcase classname="Refund" name="card 4111111111111111"/></testsuite>'
+    run = JUnitXmlParser().parse(RawResults("junit-xml", {"t.xml": xml}), run_id="r1", product="settlenxt",
+                                 suite="smoke", env="uat1", commit="mr001", masker=Masker())
+    assert run.cases[0].id == "Refund.card [PAN****1111]"
+    # known failures and quarantine entries are matched after the same masking
+    assert Masker().mask("Refund.card 4111111111111111") == run.cases[0].id

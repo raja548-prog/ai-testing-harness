@@ -276,11 +276,14 @@ class Orchestrator:
         counts: dict[str, int] = {}
         diff = self.store.get_artifact(ctx.run_id, "context/diff") or ""
         tsd = self.store.get_artifact(ctx.run_id, "context/tsd") or ""
+        # Parsers mask case ids, so mask the listed ids the same way (own masker: not counted as hits).
+        ids = Masker(categories=self.profile.logs.masking, correlation_keys=self.profile.correlation_keys())
+        known = [k.model_copy(update={"case_id": ids.mask(k.case_id)}) for k in self.profile.policy.known_failures]
+        quarantined = {ids.mask(q) for q in self.quarantined}
         for suite, run in self._atrf.items():
             cfg = self.profile.suite(suite)
             ex = registry.create("executor", cfg.executor.adapter, **cfg.executor.params)
-            remaining = apply_prechecks(
-                run, self._baseline.get(suite), self.profile.policy.known_failures, self.quarantined)
+            remaining = apply_prechecks(run, self._baseline.get(suite), known, quarantined)
             if remaining:
                 remaining = mark_flaky(remaining, self._passed_on_retry(ex, ctx, suite, {c.id for c in remaining}))
             for case in remaining:

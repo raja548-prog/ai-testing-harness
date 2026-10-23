@@ -42,8 +42,8 @@ class JenkinsTestReportParser(ResultParser):
         return ATRFRun(run_id=run_id, product=product, suite=suite, env=env, commit=commit, cases=cases)
 
     def _case(self, tc: dict[str, Any], suite: str, masker) -> ATRFCase:
-        classname = tc.get("className") or ""
-        name = tc.get("name") or "unnamed"
+        classname = masker.mask(tc.get("className") or "")  # ids are masked like names
+        name = masker.mask(tc.get("name") or "unnamed")
         status = CaseStatus.SKIPPED if tc.get("skipped") else _STATUS.get(tc.get("status", ""), CaseStatus.FAILED)
         failure = None
         if status == CaseStatus.FAILED:
@@ -56,7 +56,7 @@ class JenkinsTestReportParser(ResultParser):
                 trace=masker.mask(trace)[:4000],
             )
         return ATRFCase(
-            id=f"{classname}.{name}" if classname else name, name=masker.mask(name), suite=suite,
+            id=f"{classname}.{name}" if classname else name, name=name, suite=suite,
             status=status, duration_ms=int(float(tc.get("duration") or 0) * 1000), failure=failure,
             correlation=correlation_from_text((tc.get("stdout") or "") + "\n" + (tc.get("stderr") or "")),
         )

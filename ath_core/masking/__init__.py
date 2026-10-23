@@ -1,3 +1,3 @@
-from .masker import Masker, luhn_valid
+from .masker import CATEGORIES, Masker, luhn_valid
 
-__all__ = ["Masker", "luhn_valid"]
+__all__ = ["CATEGORIES", "Masker", "luhn_valid"]
