@@ -4,7 +4,7 @@ from __future__ import annotations
 import xml.etree.ElementTree as ET
 
 from ath_core.adapters.base import AdapterError, RawResults, ResultParser, registry
-from ath_core.schemas.atrf import ATRFCase, ATRFFailure, ATRFRun, CaseStatus
+from ath_core.schemas.atrf import ATRFCase, ATRFFailure, ATRFRun, CaseStatus, merge_duplicates
 
 # Correlation keys extracted from <properties> or system-out lines like "rrn=629014773311".
 CORRELATION_KEYS = ("rrn", "stan", "batchId", "fileName", "traceId")
@@ -33,11 +33,12 @@ class JUnitXmlParser(ResultParser):
                 root = ET.fromstring(payload)
             except ET.ParseError as e:
                 raise AdapterError(f"{fname}: not valid JUnit XML ({e})", retryable=False)
-            suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
-            for ts in suites:
-                for tc in ts.findall("testcase"):
-                    cases.append(self._case(tc, suite, masker))
-        return ATRFRun(run_id=run_id, product=product, suite=suite, env=env, commit=commit, cases=cases)
+            # Every testcase at any depth: suites nest (PHPUnit, Ant, Mocha) and some reporters put
+            # testcases directly under <testsuites>.
+            for tc in root.iter("testcase"):
+                cases.append(self._case(tc, suite, masker))
+        return ATRFRun(run_id=run_id, product=product, suite=suite, env=env, commit=commit,
+                       cases=merge_duplicates(cases))
 
     def _case(self, tc: ET.Element, suite: str, masker) -> ATRFCase:
         # Ids are masked like names: they reach ATRF, the report and events. Known failures and
@@ -55,7 +56,7 @@ class JUnitXmlParser(ResultParser):
                     message=masker.mask(el.get("message", "")),
                     trace=masker.mask((el.text or "").strip())[:4000],
                 )
-        if tc.find("skipped") is not None:
+        if failure is None and tc.find("skipped") is not None:  # a skip marker never hides a failure
             status = CaseStatus.SKIPPED
         correlation: dict[str, str] = {}
         props = tc.find("properties")

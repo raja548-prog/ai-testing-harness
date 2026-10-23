@@ -64,6 +64,24 @@ class ATRFCase(BaseModel):
         return self.status in (CaseStatus.FAILED, CaseStatus.ERROR)
 
 
+# Worst first: a failing occurrence of a test must never be hidden by a passing one with the same id.
+_SEVERITY = {CaseStatus.ERROR: 3, CaseStatus.FAILED: 2, CaseStatus.PASSED: 1, CaseStatus.SKIPPED: 0}
+
+
+def merge_duplicates(cases: list[ATRFCase]) -> list[ATRFCase]:
+    """One case per id, the worst occurrence winning (error > failed > passed > skipped).
+
+    Matrix configurations, parallel stages and several result files can report the same test more
+    than once. Pre-checks, reruns and the baseline look cases up by id, so ids must be unique.
+    """
+    merged: dict[str, ATRFCase] = {}
+    for c in cases:
+        prev = merged.get(c.id)
+        if prev is None or _SEVERITY[c.status] > _SEVERITY[prev.status]:
+            merged[c.id] = c
+    return list(merged.values())
+
+
 class ATRFSummary(BaseModel):
     total: int = 0
     passed: int = 0

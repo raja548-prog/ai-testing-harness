@@ -285,3 +285,12 @@ def test_doctor_reports_unset_secrets(monkeypatch, capsys):
     monkeypatch.delenv("SNX_JENKINS_API_TOKEN", raising=False)
     assert main(["doctor", "examples/settlenxt/test-profile.yaml"]) == 2
     assert "SNX_JENKINS_API_TOKEN is not set" in capsys.readouterr().out
+
+
+def test_matrix_configurations_with_the_same_case_keep_the_failure():
+    body = {"childReports": [{"result": report(case("settles", "FAILED", errorDetails="jdk11"))},
+                             {"result": report(case("settles", "PASSED"))}]}
+    run = JenkinsTestReportParser().parse(RawResults("jenkins-test-report", {"r.json": json.dumps(body).encode()}),
+                                          run_id="r1", product="p", suite="smoke", env="uat1", commit="c",
+                                          masker=Masker())
+    assert [(c.id, c.status) for c in run.cases] == [("snx.SmokeIT.settles", CaseStatus.FAILED)]

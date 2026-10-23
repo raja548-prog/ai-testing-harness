@@ -11,7 +11,7 @@ import json
 from typing import Any
 
 from ath_core.adapters.base import AdapterError, RawResults, ResultParser, registry
-from ath_core.schemas.atrf import ATRFCase, ATRFFailure, ATRFRun, CaseStatus
+from ath_core.schemas.atrf import ATRFCase, ATRFFailure, ATRFRun, CaseStatus, merge_duplicates
 
 from .junit_xml import correlation_from_text
 
@@ -39,7 +39,8 @@ class JenkinsTestReportParser(ResultParser):
             for ts in suites:
                 for tc in ts.get("cases") or []:
                     cases.append(self._case(tc, suite, masker))
-        return ATRFRun(run_id=run_id, product=product, suite=suite, env=env, commit=commit, cases=cases)
+        return ATRFRun(run_id=run_id, product=product, suite=suite, env=env, commit=commit,
+                       cases=merge_duplicates(cases))
 
     def _case(self, tc: dict[str, Any], suite: str, masker) -> ATRFCase:
         classname = masker.mask(tc.get("className") or "")  # ids are masked like names
