@@ -214,6 +214,7 @@ suites:
       collect: test-report      # read what the job's `junit` step published
     results: { format: jenkins-test-report }
     maxDurationMin: 15          # hard timeout for one suite run (default 60)
+    # pollSec: 30               # optional, on the executor: longest gap between status checks (1-600 s)
 
   - id: regression
     executor:
@@ -234,6 +235,8 @@ There are two ways to collect results:
 | `artifacts` | `junit-xml` | Your JUnit XML carries test ids, tags or correlation keys in `<properties>`, which Jenkins' test report drops. |
 
 A suite job that ends `UNSTABLE` (tests failed) still counts as a finished run, and its results are collected.
+
+ATH checks a running job's status 2 seconds after starting it, then waits 1.5 times longer between each check, up to `pollSec` (default 30 seconds). Set `pollSec` on a deploy or executor block to change that limit. For example, a 3-hour suite costs about 370 status checks at the default.
 
 Each suite runs twice: on the MR commit, and on the merge-base. The merge-base results are cached per commit, so later MRs on the same base reuse them.
 

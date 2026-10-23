@@ -160,6 +160,12 @@ class TestProfile(_Model):
             for sid in rule.run:
                 if sid not in ids:
                     problems.append(f"selection.rules[{i}] references unknown suite {sid!r}")
+        refs = [("deploy", self.deploy)] + [(f"suite {s.id} executor", s.executor) for s in self.suites]
+        for where, ref in refs:
+            poll = ref.params.get("pollSec")
+            if poll is not None and (isinstance(poll, bool) or not isinstance(poll, (int, float))
+                                     or not 1 <= poll <= 600):
+                problems.append(f"{where}: pollSec must be a number of seconds from 1 to 600, got {poll!r}")
         lock = self.policy.env_lock
         if lock and lock.env not in self.policy.environments:
             problems.append(f"envLock env {lock.env!r} is not in policy.environments")

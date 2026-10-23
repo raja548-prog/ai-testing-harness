@@ -37,7 +37,12 @@ from ath_core.version import CORE_VERSION
 
 from .store import StateStore
 
-POLL_SECONDS = 0.0  # real deployments poll every 15-60 s or wait on webhooks
+# Status checks on external jobs back off: the first comes after FIRST_POLL_SEC, each later gap is 1.5x
+# longer, up to the adapter's `pollSec` (default DEFAULT_POLL_SEC). Short jobs are noticed quickly; a
+# 3-hour suite costs a few hundred requests to the product's Jenkins, not thousands.
+FIRST_POLL_SEC = 2.0
+DEFAULT_POLL_SEC = 30.0
+POLL_BACKOFF = 1.5
 
 
 class GateRequired(Exception):
@@ -58,6 +63,8 @@ class Orchestrator:
         self.masker = Masker(categories=profile.logs.masking, correlation_keys=profile.correlation_keys())
         self._atrf: dict[str, ATRFRun] = {}
         self._baseline: dict[str, ATRFRun] = {}
+        self._sleep: Callable[[float], None] = time.sleep  # injectable, so tests need not wait
+        self._clock: Callable[[], float] = time.monotonic
 
     # ---------------------------------------------------------------- public API
     def start(self, ctx: RunContext, context: dict[str, str] | None = None) -> RunManifest:
@@ -225,7 +232,8 @@ class Orchestrator:
         deploy = registry.create("pipeline", self.profile.deploy.adapter, **self.profile.deploy.params)
         handle = deploy.trigger(ctx, ctx.commit)
         self.store.event(ctx.run_id, "T4", "external.call", adapter=handle.adapter, job=handle.job_ref)
-        status = self._wait(lambda: deploy.poll(handle), timeout_min=60)
+        status = self._wait(lambda: deploy.poll(handle), timeout_min=60,
+                            max_interval=self.profile.deploy.params.get("pollSec", DEFAULT_POLL_SEC))
         if status != ExecStatus.DONE:
             raise AdapterError(f"deploy of {ctx.commit} ended with {status.value}: env-blocked", retryable=False)
         return {"deployed": ctx.commit, "job": handle.job_ref}
@@ -331,19 +339,26 @@ class Orchestrator:
         return {"_skipped": True}
 
     # ---------------------------------------------------------------- helpers
-    def _wait(self, poll: Callable[[], ExecStatus], timeout_min: int) -> ExecStatus:
-        deadline = time.monotonic() + timeout_min * 60
-        while time.monotonic() < deadline:
+    def _wait(self, poll: Callable[[], ExecStatus], timeout_min: float,
+              max_interval: float = DEFAULT_POLL_SEC) -> ExecStatus:
+        """Poll until the job leaves RUNNING or the timeout passes, backing off between checks."""
+        deadline = self._clock() + timeout_min * 60
+        interval = min(FIRST_POLL_SEC, max_interval)
+        while True:
             st = poll()
             if st != ExecStatus.RUNNING:
                 return st
-            time.sleep(POLL_SECONDS or 1)
-        return ExecStatus.TIMEOUT
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                return ExecStatus.TIMEOUT
+            self._sleep(min(interval, remaining))
+            interval = min(interval * POLL_BACKOFF, max_interval)
 
     def _run_suite(self, ex, suite: str, ctx: RunContext, commit: str, max_min: int):
         handle = ex.start(suite, ctx, commit)
         self.store.event(ctx.run_id, "T5", "external.call", adapter=handle.adapter, job=handle.job_ref)
-        st = self._wait(lambda: ex.poll(handle), timeout_min=max_min)
+        st = self._wait(lambda: ex.poll(handle), timeout_min=max_min,
+                        max_interval=self.profile.suite(suite).executor.params.get("pollSec", DEFAULT_POLL_SEC))
         if st not in (ExecStatus.DONE, ExecStatus.FAILED):
             raise AdapterError(f"suite {suite} on {commit} ended with {st.value}")
         return ex.collect(handle)
