@@ -16,6 +16,7 @@ from ath_core.adapters.parsers.jenkins_test_report import JenkinsTestReportParse
 from ath_core.adapters.pipeline.jenkins import JenkinsJob, JenkinsSuiteExecutor, _Jenkins
 from ath_core.masking import Masker
 from ath_core.schemas import CaseStatus, RunContext, load_profile
+from ath_core.secrets import secret_problem
 from ath_server.orchestrator import Orchestrator, StateStore
 
 BASE = "https://jenkins.test/ci"
@@ -124,7 +125,6 @@ class FakeJenkins:
 def jenkins(monkeypatch):
     monkeypatch.setenv("T_JENKINS_TOKEN", "api-secret")
     monkeypatch.setenv("T_JENKINS_HOOK", "hook-secret")
-    _Jenkins._attempts.clear()
     fake = FakeJenkins()
     monkeypatch.setattr(_Jenkins, "transport", httpx.MockTransport(fake))
     return fake
@@ -178,9 +178,30 @@ def test_resumed_stage_reuses_existing_build(jenkins):
 
 def test_retries_are_new_attempts(jenkins):
     ex = JenkinsSuiteExecutor(**COMMON, job="snx-smoke")
-    for _ in range(3):
-        run_to_end(ex, ex.start("smoke", ctx(), "mr001"))
+    for i in range(3):
+        run_to_end(ex, ex.start("smoke", ctx(), "mr001", attempt=i))
     assert [p["ATH_KEY"] for _, p in jenkins.triggers] == [f"r1:smoke:mr001:{i}" for i in range(3)]
+
+
+def test_same_attempt_after_a_restart_reuses_its_build(jenkins):
+    # The attempt number comes from the orchestrator, not from process memory: a new adapter
+    # (as after a restart) finds the T5 build, and the first flaky rerun still triggers a new one.
+    first = JenkinsSuiteExecutor(**COMMON, job="snx-smoke").start("smoke", ctx(), "mr001")
+    run_to_end(JenkinsSuiteExecutor(**COMMON, job="snx-smoke"), first)
+    again = JenkinsSuiteExecutor(**COMMON, job="snx-smoke").start("smoke", ctx(), "mr001")
+    assert again.meta["reused"] and len(jenkins.triggers) == 1
+    JenkinsSuiteExecutor(**COMMON, job="snx-smoke").start("smoke", ctx(), "mr001", attempt=1)
+    assert len(jenkins.triggers) == 2
+
+
+@pytest.mark.parametrize("result, complete", [("SUCCESS", True), ("UNSTABLE", True), ("FAILURE", False),
+                                              ("ABORTED", False), ("NOT_BUILT", False)])
+def test_stopped_suite_builds_are_incomplete(jenkins, result, complete):
+    jenkins.result_for = lambda params: result
+    ex = JenkinsSuiteExecutor(**COMMON, job="snx-smoke")
+    h = ex.start("smoke", ctx(), "mr001")
+    run_to_end(ex, h)
+    assert ex.complete(h) is complete
 
 
 def test_unstable_is_finished_for_suites_but_failed_for_deploy(jenkins):
@@ -294,3 +315,9 @@ def test_matrix_configurations_with_the_same_case_keep_the_failure():
                                           run_id="r1", product="p", suite="smoke", env="uat1", commit="c",
                                           masker=Masker())
     assert [(c.id, c.status) for c in run.cases] == [("snx.SmokeIT.settles", CaseStatus.FAILED)]
+
+
+@pytest.mark.parametrize("ref", ["glpat-REALTOKEN123", "abcdef0123456789abcdef:x", "s3cr3t"])
+def test_a_pasted_secret_is_never_echoed(ref):
+    problem = secret_problem(ref, "jenkins-job API token")
+    assert problem and ref not in problem and "use env:NAME" in problem

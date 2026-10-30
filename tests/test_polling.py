@@ -4,7 +4,7 @@ import yaml
 
 from ath_core.adapters import ExecStatus, ExecutionHandle, RawResults, registry
 from ath_core.adapters.base import ExecutorAdapter
-from ath_core.schemas import RunContext, load_profile
+from ath_core.schemas import RunContext, TestProfile, load_profile
 from ath_server.orchestrator import Orchestrator, StateStore
 from tests.conftest import FIXTURES, LOCAL_PROFILE
 
@@ -64,10 +64,9 @@ def test_timeout_is_respected_and_the_last_sleep_is_clamped():
     assert sum(t.sleeps) == pytest.approx(30.0)  # never sleeps past the deadline
 
 
-@registry.register("executor", "slow-executor")
 class SlowExecutor(ExecutorAdapter):
     """Reports RUNNING a few times before finishing, then serves the demo fixtures."""
-    def start(self, suite, ctx, commit):
+    def start(self, suite, ctx, commit, attempt=0):
         return ExecutionHandle("slow-executor", f"{suite}@{commit}", ctx.run_id, suite, commit, {"left": 3})
 
     def poll(self, handle):
@@ -79,7 +78,13 @@ class SlowExecutor(ExecutorAdapter):
         return RawResults("junit-xml", {p.name: p.read_bytes() for p in folder.glob("TEST-*.xml")})
 
 
-def test_suite_poll_interval_comes_from_its_executor(tmp_path):
+@pytest.fixture
+def slow_executor(monkeypatch):
+    # Registered for this test only: the adapter registry is shared by the whole session.
+    monkeypatch.setitem(registry._kinds["executor"], "slow-executor", SlowExecutor)
+
+
+def test_suite_poll_interval_comes_from_its_executor(tmp_path, slow_executor):
     data = yaml.safe_load(LOCAL_PROFILE.read_text())
     data["suites"] = [{"id": "smoke", "executor": {"adapter": "slow-executor", "pollSec": 2.5},
                        "results": {"format": "junit-xml"}}]
@@ -88,16 +93,38 @@ def test_suite_poll_interval_comes_from_its_executor(tmp_path):
     path = tmp_path / "p.yaml"
     path.write_text(yaml.safe_dump(data))
     o, t = _orch(load_profile(path))
-    o.start(RunContext(run_id="p1", product="settlenxt", commit="mr001", merge_base="base000", env="uat1",
-                       triggered_by="dev"))
+    m = o.start(RunContext(run_id="p1", product="settlenxt", commit="mr001", merge_base="base000", env="uat1",
+                           triggered_by="dev"))
+    assert m.status.value == "succeeded"
     assert t.sleeps and max(t.sleeps) <= 2.5 and t.sleeps[:2] == [2.0, 2.5]
 
 
-@pytest.mark.parametrize("value", [0, 601, "30", True])
-def test_invalid_poll_sec_is_rejected(tmp_path, value):
+@pytest.mark.parametrize("value", [0, 0.5, 601, "30", True, float("nan"), float("inf")])
+@pytest.mark.parametrize("where", ["deploy", "executor"])
+def test_invalid_poll_sec_is_rejected(where, value):
     data = yaml.safe_load(LOCAL_PROFILE.read_text())
-    data["deploy"]["pollSec"] = value
-    path = tmp_path / "p.yaml"
-    path.write_text(yaml.safe_dump(data))
-    with pytest.raises(ValueError, match="pollSec must be a number of seconds from 1 to 600"):
-        load_profile(path)
+    (data["deploy"] if where == "deploy" else data["suites"][0]["executor"])["pollSec"] = value
+    with pytest.raises(ValueError, match="pollSec"):
+        TestProfile.model_validate(data)  # field validation: no load_profile needed
+
+
+def test_poll_sec_is_a_field_not_an_adapter_param():
+    data = yaml.safe_load(LOCAL_PROFILE.read_text())
+    data["deploy"]["pollSec"] = 45
+    p = TestProfile.model_validate(data)
+    assert p.deploy.poll_sec == 45 and "pollSec" not in p.deploy.params
+
+
+@pytest.mark.parametrize("where", ["build", "logs"])
+def test_poll_sec_elsewhere_is_rejected(where):
+    data = yaml.safe_load(LOCAL_PROFILE.read_text())
+    (data["build"] if where == "build" else data["logs"]["sources"][0])["pollSec"] = 60
+    with pytest.raises(ValueError, match="pollSec only applies to deploy and suite executors"):
+        TestProfile.model_validate(data)
+
+
+def test_zero_max_duration_is_rejected():
+    data = yaml.safe_load(LOCAL_PROFILE.read_text())
+    data["suites"][0]["maxDurationMin"] = 0
+    with pytest.raises(ValueError, match="maxDurationMin"):
+        TestProfile.model_validate(data)

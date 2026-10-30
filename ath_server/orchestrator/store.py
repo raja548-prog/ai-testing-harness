@@ -10,7 +10,7 @@ import json
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ath_core.schemas.run import RunManifest, Stage, StageResult
 
@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id 
 
 class StateStore:
     def __init__(self, path: str | Path = ":memory:"):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self.db = sqlite3.connect(str(path), check_same_thread=False)
         self.db.executescript(_SCHEMA)
 
@@ -35,6 +35,33 @@ class StateStore:
     def save_manifest(self, m: RunManifest) -> None:
         with self._lock, self.db:
             self.db.execute("INSERT OR REPLACE INTO runs VALUES (?, ?)", (m.context.run_id, m.model_dump_json()))
+
+    def create_manifest(self, m: RunManifest) -> bool:
+        """Store a new run's manifest. False if the run id is already taken."""
+        with self._lock, self.db:
+            cur = self.db.execute("INSERT OR IGNORE INTO runs VALUES (?, ?)", (m.context.run_id, m.model_dump_json()))
+            return cur.rowcount == 1
+
+    def update_manifest(self, run_id: str, change: Callable[[RunManifest], None]) -> RunManifest:
+        """Read, check and write a manifest atomically (gate decisions, claiming a run).
+
+        `change` mutates the manifest or raises to leave it untouched. BEGIN IMMEDIATE also
+        serialises a CLI and the API sharing one database file.
+        """
+        with self._lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.db.execute("SELECT manifest FROM runs WHERE run_id=?", (run_id,)).fetchone()
+                if row is None:
+                    raise KeyError(f"unknown run {run_id}")
+                m = RunManifest.model_validate_json(row[0])
+                change(m)
+                self.db.execute("UPDATE runs SET manifest=? WHERE run_id=?", (m.model_dump_json(), run_id))
+            except BaseException:
+                self.db.rollback()
+                raise
+            self.db.commit()
+            return m
 
     def load_manifest(self, run_id: str) -> RunManifest | None:
         row = self.db.execute("SELECT manifest FROM runs WHERE run_id=?", (run_id,)).fetchone()

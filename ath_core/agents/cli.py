@@ -256,12 +256,18 @@ class CliAgentRunner:
                        threading.Thread(target=pump, args=(proc.stderr, err), daemon=True)]
             for t in readers:
                 t.start()
+            feeder = None
             if self.cfg.prompt_via == "stdin":
-                try:
-                    proc.stdin.write(prompt)
-                    proc.stdin.close()
-                except BrokenPipeError:
-                    pass
+                # In a thread: a large prompt blocks until the CLI reads it, and a CLI that never
+                # reads must still hit timeoutSec (the write fails once the CLI is killed).
+                def feed() -> None:
+                    try:
+                        proc.stdin.write(prompt)
+                        proc.stdin.close()
+                    except (BrokenPipeError, OSError, ValueError):
+                        pass
+                feeder = threading.Thread(target=feed, daemon=True)
+                feeder.start()
             start, stopped = time.monotonic(), ""
             while proc.poll() is None:
                 now = time.monotonic()
@@ -279,7 +285,7 @@ class CliAgentRunner:
                 except (ProcessLookupError, PermissionError):
                     pass
             proc.wait()
-            for t in readers:
+            for t in readers + ([feeder] if feeder else []):
                 t.join(timeout=5)
         return _Attempt("".join(out), "".join(err), proc.returncode, stopped)
 
@@ -379,6 +385,16 @@ def diversity_problem(cfg: HarnessConfig, models: list[str]) -> str | None:
     return None
 
 
+def model_problem(cfg: HarnessConfig) -> str | None:
+    """Why ATH cannot be sure which model the CLI uses, or None. The model policy checks the names
+    ATH passes; a command without {model} runs the CLI's own default, which nothing checks."""
+    rc = cfg.agent_runner
+    if rc is None or any("{model}" in a for a in [*rc.command, *rc.session_args]):
+        return None
+    return ("agent CLI command has no {model} placeholder, so the CLI would use its own default model, "
+            "which the model policy cannot check; pass it, e.g. [-m, \"{model}\"]")
+
+
 def build_triage_agents(cfg: HarnessConfig, profile: TestProfile) -> list[CliTriageAgent]:
     """Voters for T7 from the harness config; none when no agent runner is configured.
 
@@ -391,6 +407,8 @@ def build_triage_agents(cfg: HarnessConfig, profile: TestProfile) -> list[CliTri
     if problem := diversity_problem(cfg, models):
         raise ValueError(problem)
     if problem := load_policy(cfg.model_policy).problem(models, "triage", profile.product):
+        raise ValueError(problem)
+    if problem := model_problem(cfg):
         raise ValueError(problem)
     skill = load_skill(cfg.skills_dir / "t07-triage" / "SKILL.md")
     runner = CliAgentRunner(rc)

@@ -19,6 +19,7 @@ class Vote:
     category: TriageCategory
     evidence: str = ""
     note: str = ""  # why the vote was discarded or is unknown
+    error: bool = False  # the agent call failed (CLI error, timeout, no usable output): no opinion at all
 
 
 class TriageAgent(Protocol):
@@ -38,7 +39,7 @@ def _cast(agent: TriageAgent, case: ATRFCase, evidence: dict[str, Any]) -> Vote:
     try:
         out = agent.classify(case, evidence)
     except Exception as e:  # an agent error counts as an "unknown" vote, never a crash
-        return Vote(TriageCategory.UNKNOWN, note=f"{name}: {e}"[:300])
+        return Vote(TriageCategory.UNKNOWN, note=f"{name}: {e}"[:300], error=True)
     v = out if isinstance(out, Vote) else Vote(out)
     if v.category not in AGENT_CATEGORIES:
         return Vote(TriageCategory.UNKNOWN, note=f"{name}: category {getattr(v.category, 'value', v.category)!r} "
@@ -56,15 +57,18 @@ def vote(case: ATRFCase, agents: list[TriageAgent], evidence: dict[str, Any], qu
     cast = [_cast(agent, case, evidence) for agent in agents]
     votes = [v.category.value for v in cast]
     notes = [v.note for v in cast if v.note]
+    errors = sum(v.error for v in cast)
     quorum = quorum or default_quorum(len(votes))
     ranked = Counter(votes).most_common(2)
     top, n = ranked[0] if ranked else (TriageCategory.UNKNOWN.value, 0)
     if len(ranked) > 1 and ranked[1][1] == n:
         return Triage(category=TriageCategory.UNKNOWN, confidence=0.0, decided_by="vote",
-                      reason=f"votes tied {n}-{n}; needs human review", votes=votes, notes=notes)
+                      reason=f"votes tied {n}-{n}; needs human review", votes=votes, notes=notes, errors=errors)
     if n >= quorum and top != TriageCategory.UNKNOWN.value:
         return Triage(category=TriageCategory(top), confidence=n / len(votes), decided_by="vote",
                       reason=f"{n} of {len(votes)} agents agreed", votes=votes,
-                      evidence=[v.evidence for v in cast if v.category.value == top and v.evidence], notes=notes)
+                      evidence=[v.evidence for v in cast if v.category.value == top and v.evidence], notes=notes,
+                      errors=errors)
     return Triage(category=TriageCategory.UNKNOWN, confidence=0.0, decided_by="vote",
-                  reason=f"no quorum ({quorum} of {len(votes)} needed); needs human review", votes=votes, notes=notes)
+                  reason=f"no quorum ({quorum} of {len(votes)} needed); needs human review", votes=votes, notes=notes,
+                  errors=errors)

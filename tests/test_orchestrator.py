@@ -2,7 +2,8 @@ import json
 
 import pytest
 
-from ath_core.adapters.fake import FakeLock, FakePipeline
+from ath_core.adapters import registry
+from ath_core.adapters.fake import FakeExecutor, FakeLock, FakePipeline
 from ath_core.schemas import (
     RunContext, RunMode, RunStatus, Stage, StageStatus, TriageCategory, load_profile,
 )
@@ -151,3 +152,81 @@ def test_configured_quorum_is_used_for_triage(tmp_path, quorum, expected):
                      agents=agents, quorum=quorum)
     o.start(_ctx())
     assert _cats(o.store, "r1")["SNX-001"] == expected
+
+
+def test_run_id_is_checked():
+    for bad in ("../x", "a/b", ".hidden", ""):
+        with pytest.raises(ValueError):
+            _ctx(bad)
+
+
+def test_existing_run_id_with_other_inputs_is_refused(orch):
+    orch.start(_ctx())
+    with pytest.raises(ValueError, match="already exists with different inputs"):
+        orch.start(_ctx(commit="mr002"))
+
+
+def test_a_running_run_is_not_executed_twice(orch):
+    orch.start(_ctx())
+    orch.store.update_manifest("r1", lambda m: setattr(m, "status", RunStatus.RUNNING))  # e.g. another process
+    with pytest.raises(ValueError, match="already running"):
+        orch.resume("r1")
+    assert orch.resume("r1", force=True).status == RunStatus.SUCCEEDED  # its process died: take it over
+
+
+def test_resume_after_a_failure_takes_the_env_again_and_redeploys(orch, monkeypatch):
+    t5 = orch.t5_execute
+
+    def broken_once(ctx):
+        monkeypatch.setattr(orch, "t5_execute", t5)
+        raise RuntimeError("executor crashed")
+    monkeypatch.setattr(orch, "t5_execute", broken_once)
+    assert orch.start(_ctx()).status == RunStatus.FAILED and FakeLock.held == {}
+    FakeLock.held["uat1"] = "other-run"  # someone else took the env and deployed their build
+    m = orch.resume("r1")
+    assert m.status == RunStatus.FAILED and "held by another run" in m.stages[Stage.T4_ENV].error
+    FakeLock.held.clear()
+    deploys = len(FakePipeline.triggered)
+    assert orch.resume("r1").status == RunStatus.SUCCEEDED
+    assert len(FakePipeline.triggered) == deploys + 1  # redeployed before running the suites
+    # one redeploy decision: the first resume dropped the done T4; the second simply runs T4 again
+    assert [k for _, k, _ in orch.store.events("r1")].count("env.redeploy") == 1
+
+
+def test_resume_after_a_t6_failure_part_way_keeps_all_results(orch, monkeypatch):
+    parse = orch._parse
+
+    def fail_on_regression(raw, ctx, suite, commit):
+        if suite == "regression" and commit == ctx.commit:
+            raise RuntimeError("parser crashed")
+        return parse(raw, ctx, suite, commit)
+    monkeypatch.setattr(orch, "_parse", fail_on_regression)
+    assert orch.start(_ctx()).status == RunStatus.FAILED
+    monkeypatch.setattr(orch, "_parse", parse)
+    assert orch.resume("r1").status == RunStatus.SUCCEEDED
+    smoke = ATRFRun.model_validate_json(orch.store.get_artifact("r1", "atrf/smoke.json"))
+    assert smoke.summary.total == 5  # not re-parsed from wiped raw results
+    assert json.loads(orch.store.get_artifact("r1", "raw/regression")) == {}  # wiped once all parsed
+
+
+def test_one_orchestrator_keeps_runs_apart(orch):
+    orch.start(_ctx("r1"))
+    orch.start(_ctx("r2", changed_paths=["README.md"]))  # matches no rule: the default suite, smoke
+    assert orch.store.get_artifact("r2", "atrf/regression.json") is None
+    assert "regression" not in orch.store.get_artifact("r2", "report.md")
+
+
+class _StoppedEarly(FakeExecutor):
+    def complete(self, handle):
+        return False
+
+
+def test_incomplete_suite_blocks_the_verdict_and_is_never_a_baseline(tmp_path, monkeypatch):
+    monkeypatch.setitem(registry._kinds["executor"], "fake-executor", _StoppedEarly)
+    o = Orchestrator(load_profile(LOCAL_PROFILE), StateStore(":memory:"), report_dir=tmp_path)
+    m = o.start(_ctx())
+    assert m.stages[Stage.T5_EXECUTE].output["incomplete"] == ["smoke", "regression"]
+    assert o.store.get_baseline("settlenxt", "base000", "smoke") is None
+    assert ATRFRun.model_validate_json(o.store.get_artifact("r1", "atrf/smoke.json")).incomplete
+    report = o.store.get_artifact("r1", "report.md")
+    assert "Verdict: BLOCKED" in report and "Incomplete results" in report

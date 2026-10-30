@@ -82,3 +82,20 @@ def test_a_tie_for_first_is_never_a_verdict(answers):
     for order in (answers, answers[::-1]):  # voter order must not matter
         t = _votes(*order, quorum=1)
         assert t.category == UNK and "tied" in t.reason
+
+
+def _failing(cid, message, type_="AssertionError"):
+    return ATRFCase(id=cid, name=cid, suite="s", status=F, failure=ATRFFailure(type=type_, message=message))
+
+
+def _one(case, commit):
+    return ATRFRun(run_id="r", product="p", suite="s", env="uat1", commit=commit, cases=[case])
+
+
+def test_pre_existing_needs_the_same_failure_on_the_baseline():
+    base = _one(_failing("t", "fee mismatch 0.01 for batch B20261016-07"), "base")
+    same = _one(_failing("t", "fee mismatch 0.02 for batch B20261023-01"), "mr")  # numbers and ids differ
+    assert apply_prechecks(same, base, [], set()) == []
+    assert same.cases[0].triage.category == TriageCategory.PRE_EXISTING
+    other = _one(_failing("t", "NullPointerException in FeeCalculator", "java.lang.NullPointerException"), "mr")
+    assert [c.id for c in apply_prechecks(other, base, [], set())] == ["t"]  # a new way to fail: triage it

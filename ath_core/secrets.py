@@ -13,7 +13,7 @@ from ath_core.adapters.base import AdapterError
 def resolve_secret(ref: str | None, what: str) -> str:
     if not ref:
         raise AdapterError(f"{what}: no secret reference configured", retryable=False)
-    scheme, _, name = ref.partition(":")
+    scheme, sep, name = ref.partition(":")
     if scheme == "env" and name:
         value = os.environ.get(name)
         if not value:
@@ -22,7 +22,10 @@ def resolve_secret(ref: str | None, what: str) -> str:
     if scheme == "vault":
         raise AdapterError(f"{what}: vault references need the platform credential broker, "
                            f"which is not available yet; use env:NAME for now", retryable=False)
-    raise AdapterError(f"{what}: unsupported secret reference {ref!r}; use env:NAME", retryable=False)
+    # Never echo the reference: a common mistake is pasting the secret itself, and this text
+    # reaches doctor output, run events and the CLI.
+    shape = f"scheme {scheme!r}" if sep and scheme.isalpha() and len(scheme) <= 10 else "no known `scheme:` prefix"
+    raise AdapterError(f"{what}: unsupported secret reference ({shape}); use env:NAME", retryable=False)
 
 
 def secret_problem(ref: str | None, what: str) -> str | None:

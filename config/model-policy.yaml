@@ -8,7 +8,7 @@ dataClasses:
   internal:            # source diffs, TSD text, product skill: no payment data
     allowed: ["local/*", "onprem-*"]
   public:              # nothing product-specific
-    allowed: ["*"]
+    allowed: ["**"]                 # any model: `*` would stop at a `/`
 
 stages:                # what each LLM stage sends to its model; a stage not listed is `restricted`
   impact: internal     # T1: diff + TSD + product skill

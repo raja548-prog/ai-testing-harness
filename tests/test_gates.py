@@ -108,7 +108,7 @@ def test_api_gate_endpoints(tmp_path, monkeypatch):
     client = TestClient(appmod.app)
     body = {"product": "settlenxt", "commit": "mr001", "merge_base": "base000", "env": "uat1", "mode": "assist"}
     run_id = client.post("/runs", json=body, headers={"X-ATH-User": "dev-asha"}).json()["run_id"]
-    assert client.get(f"/runs/{run_id}").json()["status"] == "waiting-gate"
+    assert client.get(f"/runs/{run_id}", headers={"X-ATH-User": "u123"}).json()["status"] == "waiting-gate"
     url = f"/runs/{run_id}/gates/T10"
     r = client.post(f"{url}/approve", json={"comment": "mine"},
                     headers={"X-ATH-User": "dev-asha", "X-ATH-Groups": "settlement-dept"})
@@ -117,6 +117,34 @@ def test_api_gate_endpoints(tmp_path, monkeypatch):
     r = client.post(f"{url}/approve", json={"comment": "ok"},
                     headers={"X-ATH-User": "lead-ravi", "X-ATH-Groups": "settlement-dept"})
     assert r.status_code == 202 and r.json()["decision"] == "approved"
-    assert client.get(f"/runs/{run_id}").json()["status"] == "succeeded"
+    assert client.get(f"/runs/{run_id}", headers={"X-ATH-User": "u123"}).json()["status"] == "succeeded"
     assert client.post(f"/runs/{run_id}/gates/T99/approve", json={},
                        headers={"X-ATH-User": "lead-ravi"}).status_code == 400
+
+
+def test_self_approval_is_refused_whatever_the_case_or_spacing(parked):
+    for user in ("DEV-ASHA", " dev-asha "):
+        with pytest.raises(PermissionError, match="triggered this run"):
+            parked.approve("g1", Stage.T10_REMEDIATE, user, OWNERS)
+
+
+def test_rejected_run_cannot_be_started_again(parked):
+    parked.reject("g1", Stage.T10_REMEDIATE, "lead-ravi", OWNERS, "wrong fix")
+    ctx = parked.store.load_manifest("g1").context
+    with pytest.raises(ValueError, match="rejected"):
+        parked.start(ctx)  # same run id: must not run the gate again and get it approved
+    assert parked.store.load_manifest("g1").status == RunStatus.REJECTED
+
+
+def test_a_decided_gate_cannot_be_decided_the_other_way(parked):
+    parked.reject("g1", Stage.T10_REMEDIATE, "lead-ravi", OWNERS)
+    with pytest.raises(PermissionError, match="not waiting"):
+        parked.record_gate("g1", Stage.T10_REMEDIATE, "approved", "lead-mira", OWNERS)
+    m = parked.store.load_manifest("g1")
+    assert m.status == RunStatus.REJECTED and [g.decision for g in m.gates] == ["rejected"]
+
+
+def test_double_approval_is_refused(parked):
+    parked.record_gate("g1", Stage.T10_REMEDIATE, "approved", "lead-ravi", OWNERS)
+    with pytest.raises(PermissionError, match="already approved"):
+        parked.record_gate("g1", Stage.T10_REMEDIATE, "approved", "lead-mira", OWNERS)

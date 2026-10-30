@@ -5,11 +5,12 @@ contains scripts. The core validates it before any run starts.
 """
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ath_core.masking import CATEGORIES as MASK_CATEGORIES
 
@@ -29,6 +30,18 @@ class AdapterRef(BaseModel):
     def params(self) -> dict[str, Any]:
         return dict(self.model_extra or {})
 
+    @model_validator(mode="after")
+    def _poll_sec_only_where_polled(self) -> "AdapterRef":
+        if "pollSec" in (self.model_extra or {}):
+            raise ValueError("pollSec only applies to deploy and suite executors, whose jobs ATH polls")
+        return self
+
+
+class PolledAdapterRef(AdapterRef):
+    """An adapter whose jobs ATH polls for status: deploy and suite executors."""
+    # Longest wait between status checks; polling starts faster and backs off up to this.
+    poll_sec: float | None = Field(None, alias="pollSec", ge=1, le=600, strict=True)
+
 
 class Repos(_Model):
     code: str
@@ -41,7 +54,7 @@ class HealthCheck(_Model):
     timeout_sec: int = Field(600, alias="timeoutSec")
 
 
-class DeployConfig(AdapterRef):
+class DeployConfig(PolledAdapterRef):
     health_check: HealthCheck | None = Field(None, alias="healthCheck")
 
 
@@ -53,9 +66,9 @@ class ResultsConfig(_Model):
 
 class SuiteConfig(_Model):
     id: str
-    executor: AdapterRef
+    executor: PolledAdapterRef
     results: ResultsConfig
-    max_duration_min: int = Field(60, alias="maxDurationMin")
+    max_duration_min: int = Field(60, alias="maxDurationMin", ge=1)
 
 
 class SelectionWhen(_Model):
@@ -68,7 +81,7 @@ class SelectionRule(_Model):
 
 
 class Selection(_Model):
-    default: list[str]
+    default: list[str] = Field(min_length=1)
     rules: list[SelectionRule] = Field(default_factory=list)
 
 
@@ -82,6 +95,15 @@ class TestAuthoring(_Model):
 class LogsConfig(_Model):
     sources: list[AdapterRef] = Field(min_length=1)
     masking: list[str] = Field(default_factory=lambda: list(MASK_CATEGORIES))
+
+    @model_validator(mode="after")
+    def _keys_are_lists(self) -> "LogsConfig":
+        for i, src in enumerate(self.sources):
+            keys = src.params.get("keys")
+            if keys is not None and not (isinstance(keys, list) and all(isinstance(k, str) for k in keys)):
+                # `keys: rrn` would otherwise become the keys r, r, n
+                raise ValueError(f"logs.sources[{i}].keys must be a list of key names, e.g. [rrn, stan]; got {keys!r}")
+        return self
 
     @field_validator("masking")
     @classmethod
@@ -102,6 +124,15 @@ class KnownFailure(_Model):
     case_id: str = Field(alias="caseId")
     ticket: str
     expires: str  # ISO date, e.g. 2026-12-31
+
+    @field_validator("expires")
+    @classmethod
+    def _iso_date(cls, v: str) -> str:
+        try:
+            date.fromisoformat(v)
+        except ValueError:
+            raise ValueError(f"expires must be an ISO date like 2026-12-31, got {v!r}")
+        return v
 
 
 class Policy(_Model):
@@ -171,12 +202,6 @@ class TestProfile(_Model):
             for sid in rule.run:
                 if sid not in ids:
                     problems.append(f"selection.rules[{i}] references unknown suite {sid!r}")
-        refs = [("deploy", self.deploy)] + [(f"suite {s.id} executor", s.executor) for s in self.suites]
-        for where, ref in refs:
-            poll = ref.params.get("pollSec")
-            if poll is not None and (isinstance(poll, bool) or not isinstance(poll, (int, float))
-                                     or not 1 <= poll <= 600):
-                problems.append(f"{where}: pollSec must be a number of seconds from 1 to 600, got {poll!r}")
         lock = self.policy.env_lock
         if lock and lock.env not in self.policy.environments:
             problems.append(f"envLock env {lock.env!r} is not in policy.environments")

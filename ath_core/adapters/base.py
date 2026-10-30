@@ -65,7 +65,10 @@ class PipelineAdapter(ABC):
         self.params = params
 
     @abstractmethod
-    def trigger(self, ctx: RunContext, commit: str, extra: dict[str, Any] | None = None) -> ExecutionHandle: ...
+    def trigger(self, ctx: RunContext, commit: str, extra: dict[str, Any] | None = None,
+                attempt: int = 0) -> ExecutionHandle:
+        """Start the job. `attempt` is 0, then 1, 2... when the orchestrator deploys again (resume after
+        the env hold was lost). Adapters that reuse an existing job for the same inputs must key on it."""
 
     @abstractmethod
     def poll(self, handle: ExecutionHandle) -> ExecStatus: ...
@@ -82,7 +85,10 @@ class ExecutorAdapter(ABC):
         return []
 
     @abstractmethod
-    def start(self, suite: str, ctx: RunContext, commit: str) -> ExecutionHandle: ...
+    def start(self, suite: str, ctx: RunContext, commit: str, attempt: int = 0) -> ExecutionHandle:
+        """Start a suite run. `attempt` is 0 for the first run of this suite on this commit in this run,
+        n for the n-th T7 flaky rerun. It is the same after a resume, so an adapter that reuses an
+        existing job for the same inputs (idempotent triggers) must key on it."""
 
     @abstractmethod
     def poll(self, handle: ExecutionHandle) -> ExecStatus: ...
@@ -92,6 +98,10 @@ class ExecutorAdapter(ABC):
 
     def cancel(self, handle: ExecutionHandle) -> None:  # optional
         return None
+
+    def complete(self, handle: ExecutionHandle) -> bool:  # optional
+        """False when the job stopped early (aborted, crashed), so collected results may be partial."""
+        return True
 
 
 class ResultParser(ABC):

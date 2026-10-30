@@ -73,6 +73,10 @@ def create_run(req: RunRequest, bg: BackgroundTasks, x_ath_user: str | None = He
     ctx = RunContext(run_id=f"ath-{uuid.uuid4().hex[:10]}", product=req.product, mode=req.mode, mr=req.mr,
                      jira=req.jira, commit=req.commit, merge_base=req.merge_base, env=req.env,
                      changed_paths=req.changed_paths, triggered_by=user, trigger_source="web")
+    try:
+        orch.check(ctx)  # refuse now: once queued, a refusal would only surface as a run that never appears
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     context = {k: v for k, v in (("diff", req.diff), ("tsd", req.tsd)) if v}
     bg.add_task(orch.start, ctx, context)
     return {"run_id": ctx.run_id, "status": "queued"}
@@ -88,7 +92,11 @@ def decide_gate(run_id: str, gate: str, action: str, req: GateRequest, bg: Backg
     m = STORE.load_manifest(run_id)
     if m is None:
         raise HTTPException(404, "unknown run")
-    orch = _orchestrator(m.context.product, m.profile_ref or "test-profile.local.yaml")
+    ref = m.profile_ref or "test-profile.local.yaml"
+    if not (PROFILE_DIR / ref).resolve().is_relative_to(PROFILE_DIR.resolve()) or not (PROFILE_DIR / ref).exists():
+        raise HTTPException(409, f"run {run_id} was started with profile {ref!r}, which this server does not "
+                                 f"serve (e.g. a CLI run); decide its gates where it was started")
+    orch = _orchestrator(m.context.product, ref)
     groups = [g.strip() for g in (x_ath_groups or "").split(",") if g.strip()]
     decision = "approved" if action == "approve" else "rejected"
     try:
@@ -102,8 +110,10 @@ def decide_gate(run_id: str, gate: str, action: str, req: GateRequest, bg: Backg
     return {"run_id": run_id, "gate": gate, "decision": decision}
 
 
+# Reads need an identity too: manifests, reports and events name people, commits and failures.
 @app.get("/runs/{run_id}")
-def get_run(run_id: str) -> dict:
+def get_run(run_id: str, x_ath_user: str | None = Header(None)) -> dict:
+    _user(x_ath_user)
     m = STORE.load_manifest(run_id)
     if not m:
         raise HTTPException(404, "unknown run")
@@ -111,7 +121,8 @@ def get_run(run_id: str) -> dict:
 
 
 @app.get("/runs/{run_id}/report", response_class=PlainTextResponse)
-def get_report(run_id: str) -> str:
+def get_report(run_id: str, x_ath_user: str | None = Header(None)) -> str:
+    _user(x_ath_user)
     body = STORE.get_artifact(run_id, "report.md")
     if body is None:
         raise HTTPException(404, "no report yet")
@@ -119,5 +130,6 @@ def get_report(run_id: str) -> str:
 
 
 @app.get("/runs/{run_id}/events")
-def get_events(run_id: str) -> list[dict]:
+def get_events(run_id: str, x_ath_user: str | None = Header(None)) -> list[dict]:
+    _user(x_ath_user)
     return [{"stage": s, "kind": k, "detail": d} for s, k, d in STORE.events(run_id)]

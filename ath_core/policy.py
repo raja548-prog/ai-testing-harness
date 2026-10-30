@@ -10,10 +10,14 @@ its own data into cloud models. Per-product exceptions go in `productOverrides`,
   dataClasses:      { restricted: { allowed: ["local/*"] }, internal: {...}, public: {...} }
   stages:           { triage: restricted, impact: internal, ... }   # unknown stage -> restricted
   productOverrides: { settlenxt: { impact: public } }
+
+Globs: `*` matches within one `/`-separated part of a model name and `**` matches across parts, so
+`onprem-*` does not allow `onprem-proxy/openai/gpt-4o`. `**` alone allows every model.
 """
 from __future__ import annotations
 
-import fnmatch
+import re
+from functools import lru_cache
 from pathlib import Path
 
 import yaml
@@ -22,6 +26,18 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from ath_core.assets import asset_path
 
 DEFAULT_POLICY = asset_path("config/model-policy.yaml")
+
+
+@lru_cache(maxsize=256)
+def _glob(pattern: str) -> re.Pattern[str]:
+    out = ""
+    for part in re.split(r"(\*\*|\*|\?)", pattern):
+        out += {"**": ".*", "*": "[^/]*", "?": "[^/]"}.get(part, re.escape(part))
+    return re.compile(out)
+
+
+def model_matches(model: str, pattern: str) -> bool:
+    return _glob(pattern).fullmatch(model) is not None
 FALLBACK_CLASS = "restricted"
 
 
@@ -54,7 +70,7 @@ class ModelPolicy(_Model):
 
     def allows(self, model: str, stage: str, product: str) -> bool:
         rule = self.data_classes[self.data_class(stage, product)]
-        return bool(model) and any(fnmatch.fnmatchcase(model, g) for g in rule.allowed)
+        return bool(model) and any(model_matches(model, g) for g in rule.allowed)
 
     def problem(self, models: list[str], stage: str, product: str) -> str | None:
         """Why these models may not run this stage for this product, or None."""

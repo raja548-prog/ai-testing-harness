@@ -212,9 +212,9 @@ suites:
       tokenRef: env:SNX_JENKINS_API_TOKEN
       params: { COMMIT_ID: "${commit}", ENV: "${env}" }
       collect: test-report      # read what the job's `junit` step published
+      # pollSec: 30             # optional: longest gap between status checks (1-600 s)
     results: { format: jenkins-test-report }
     maxDurationMin: 15          # hard timeout for one suite run (default 60)
-    # pollSec: 30               # optional, on the executor: longest gap between status checks (1-600 s)
 
   - id: regression
     executor:
@@ -236,7 +236,7 @@ There are two ways to collect results:
 
 A suite job that ends `UNSTABLE` (tests failed) still counts as a finished run, and its results are collected.
 
-ATH checks a running job's status 2 seconds after starting it, then waits 1.5 times longer between each check, up to `pollSec` (default 30 seconds). Set `pollSec` on a deploy or executor block to change that limit. For example, a 3-hour suite costs about 370 status checks at the default.
+ATH checks a running job's status 2 seconds after starting it, then waits 1.5 times longer between each check, up to `pollSec` (default 30 seconds). Set `pollSec` inside a `deploy` or suite `executor` block to change that limit; it is rejected anywhere else. For example, a 3-hour suite costs about 370 status checks at the default.
 
 Each suite runs twice: on the MR commit, and on the merge-base. The merge-base results are cached per commit, so later MRs on the same base reuse them.
 
@@ -246,25 +246,15 @@ Each suite runs twice: on the MR commit, and on the merge-base. The merge-base r
 selection:
   default: [smoke]                       # always run
   rules:
-    - when: { pathsChanged: ["clearing/*", "*/clearing/*"] }
+    - when: { pathsChanged: ["**/clearing/**"] }
       run: [smoke, regression]           # added when any changed path matches
 ```
 
 Rules add suites; they never remove them.
 
-Patterns are shell-style, and `*` also matches `/`. To match a folder at any depth, list two patterns:
+Patterns are shell-style. `**/` and `/**` also match zero folders, so `**/clearing/**` matches a `clearing/` folder at any depth, including the top level (`clearing/Fee.java`, `src/main/java/clearing/Fee.java`). `*` also matches `/`, as in older profiles, so `*clearing/*` matches unrelated folders such as `preclearing/`: prefer `**/clearing/**`.
 
-| Pattern | Matches | Doesn't match |
-| --- | --- | --- |
-| `clearing/*` | `clearing/Fee.java`, at the top level | `src/main/java/clearing/Fee.java` |
-| `*/clearing/*` | `src/main/java/clearing/Fee.java`, at any depth below the top | `clearing/Fee.java` |
-
-Avoid two other forms:
-
-- `*clearing/*` also matches unrelated folders such as `preclearing/`.
-- `**/clearing/**` behaves like `*/clearing/*`, so it misses a top-level `clearing/` folder.
-
-Changed paths come from `--changed`.
+Changed paths come from `--changed`. A run with no changed paths runs every suite: without them, nothing shows that the change is small.
 
 #### `logs`: where triage gets log lines
 
@@ -276,7 +266,7 @@ logs:
   masking: [pan, cvv, track2, aadhaar, mobile]    # the default; PIN blocks are always masked
 ```
 
-**The log API.** `log-api` calls `GET {endpoint}?from=&to=&maxLines=&key=rrn:629…` and expects `{"lines": [...], "truncated": false}` back. Logs are fetched by the failing test's correlation keys.
+**The log API.** `log-api` calls `GET {endpoint}?product=&component=&from=&to=&maxLines=&key=rrn:629…` and expects `{"lines": [...], "truncated": false}` back. `product` is the profile's product; set `component` on the source if the service needs it. Logs are fetched by the failing test's correlation keys: a failure with none of the declared keys gets no log lines, rather than any lines from the time window.
 
 **Correlation keys.** `keys` declares the product's correlation keys, and ATH uses them in two ways:
 
@@ -428,7 +418,8 @@ These placeholders are filled in for each session:
 
 Safety rules ATH enforces:
 
-- **No auto-approve.** ATH refuses a command containing `--yolo`, `--always-approve` or `bypassPermissions`. Without them, headless `ainxt` cancels any tool call that would need approval.
+- **No auto-approve.** ATH refuses a session whose `command`, `sessionArgs`, `resumeArgs` or `setEnv` would approve tool calls by itself: `--yolo`, `--always-approve`, `bypassPermissions`, `--dangerously-skip-permissions`, `acceptEdits`, `--full-auto`, `-y`, or a `--permission-mode`/`--approval-mode` of `auto`. Without them, headless `ainxt` cancels any tool call that would need approval.
+- **The model is ATH's choice.** The command must pass `{model}` (in `command` or `sessionArgs`). Without it the CLI would use its own default model, which the model policy can't check.
 - **A minimal environment.** The session sees only `PATH`, `HOME`, locale settings, the `passEnv` variables and the `setEnv` values. Jenkins tokens and other secrets are withheld.
 - **Masked data only.** The session only ever receives masked data.
 - **No side effects.** It never touches Jenkins, Git or UAT; those actions go through ATH.
@@ -437,7 +428,7 @@ Safety rules ATH enforces:
 
 ### 6.3 Model policy
 
-[`config/model-policy.yaml`](../config/model-policy.yaml) assigns each stage a data class, and each data class lists the model-name patterns allowed to receive it.
+[`config/model-policy.yaml`](../config/model-policy.yaml) assigns each stage a data class, and each data class lists the model-name patterns allowed to receive it. In a pattern, `*` stops at a `/` (`onprem-*` doesn't allow `onprem-proxy/openai/gpt-4o`) and `**` matches anything.
 
 The default is strict. Test results, logs, diffs and TSDs are `restricted` or `internal`, and only `local/*` and `onprem-*` models may receive them.
 
@@ -467,7 +458,8 @@ ainxt-ath run --profile test-profile.yaml \
 | --- | --- |
 | `--commit`, `--merge-base` | The MR's commit and its merge-base (`git merge-base origin/main HEAD`). Both are tested. |
 | `--env` | Must be listed in the profile's `policy.environments`. |
-| `--changed` | Changed paths, used for suite selection (`git diff --name-only <merge-base>..<commit>`). |
+| `--changed` | Changed paths, used for suite selection (`git diff --name-only <merge-base>..<commit>`). Without any, every suite runs. |
+| `--run-id` | Optional. Letters, digits, `.`, `_` and `-`, starting with a letter or digit. Reusing an id continues that run, and only with the same inputs. |
 | `--mode` | `report-only` (default; no changes made), `assist` or `autofix`. |
 | `--user` | Who triggered the run. Gates use it for separation of duties. Defaults to `local-user`. |
 | `--diff` | The MR's unified diff (`git diff <merge-base>..<commit>`), given to triage. |
@@ -493,7 +485,7 @@ These are the categories:
 
 | Category | Decided by | Blocks? |
 | --- | --- | --- |
-| `pre-existing` | Also fails on the merge-base | No |
+| `pre-existing` | Also fails on the merge-base, the same way (failure type and message, ignoring numbers and ids) | No |
 | `flaky` | Passed on a retry | No |
 | `known-failure` | Listed in `knownFailures` and not expired | No |
 | `quarantined` | Listed in the `--quarantine` file | No |
@@ -548,7 +540,11 @@ ainxt-ath report <runId>                                # print the report again
 ainxt-ath events <runId>                                # audit trail
 ```
 
-Resuming never repeats a deploy or a test run that already finished.
+Resuming never repeats a test run that already finished. A deploy is repeated only when the run failed after it: a failed run gives up its environment hold, so another run may have deployed since. ATH takes the hold again and redeploys before running more tests.
+
+A run marked `running` is never executed twice. If the process running it died, take it over with `ainxt-ath resume <runId> --force`. A rejected run stays stopped, under its own id too.
+
+A suite job that stopped early (Jenkins `FAILURE`, `ABORTED` or `NOT_BUILT`) is reported as `(incomplete)` and makes the verdict BLOCKED: the tests that never ran can't be judged. An incomplete merge-base run is never cached as a baseline.
 
 The audit trail lists:
 
@@ -559,7 +555,7 @@ The audit trail lists:
 
 ### 7.6 The API
 
-All requests need `X-ATH-User`. Gate decisions also take `X-ATH-Groups` (comma-separated).
+All requests need `X-ATH-User`, reads included. Gate decisions also take `X-ATH-Groups` (comma-separated). `POST /runs` refuses a run the profile does not allow (wrong product, environment not in `policy.environments`) with 400, before queueing it. Gates of a run started from the CLI are decided with the CLI.
 
 | Request | What it does |
 | --- | --- |
@@ -628,9 +624,9 @@ A run makes 3 CLI sessions per case, one after another, so allow time for it.
 | `doctor <profile> [--config]` | Plus adapters, settings, secrets, agent CLI, model policy | 0 ok, 2 problems |
 | `run --profile … --commit … --merge-base … --env …` | Start a run | 0 succeeded or waiting at a gate, 1 otherwise |
 | `approve` / `reject <runId> --gate --user [--groups] [--comment]` | Decide a gate | 0 done, 1 refused |
-| `resume <runId> --profile …` | Continue a run | 0 or 1 |
+| `resume <runId> --profile … [--force]` | Continue a run; `--force` takes over a run whose process died | 0 or 1 |
 | `report <runId>` / `events <runId>` | Print the report or the audit trail | 0 or 1 |
-| `eval <dataset> --profile … [--min-accuracy] [--max-missed-regressions]` | Score triage | 0 pass, 1 refused, 3 a gate failed |
+| `eval <dataset> --profile … [--min-accuracy] [--max-missed-regressions] [--max-error-rate]` | Score triage. Fails if over 10% of voter calls error, or an injection case gets no working vote | 0 pass, 1 refused, 3 a gate failed |
 
 ### 10.2 Environment variables
 

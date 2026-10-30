@@ -51,3 +51,26 @@ def test_masking_categories_are_checked(tmp_path):
     data["logs"]["masking"] = ["pan", "cvc"]
     with pytest.raises(ValidationError, match="unknown masking categories"):
         TestProfile.model_validate(data)
+
+
+def _validate(change):
+    data = yaml.safe_load(LOCAL_PROFILE.read_text())
+    change(data)
+    return TestProfile.model_validate(data)
+
+
+def test_known_failure_expiry_must_be_an_iso_date():
+    def bad_date(d):
+        d["policy"]["knownFailures"] = [{"caseId": "x", "ticket": "T-1", "expires": "31/12/2026"}]
+    with pytest.raises(ValidationError, match="ISO date"):
+        _validate(bad_date)
+
+
+def test_log_source_keys_must_be_a_list():
+    with pytest.raises(ValidationError, match="must be a list"):
+        _validate(lambda d: d["logs"]["sources"][0].update(keys="rrn"))
+
+
+def test_selection_default_cannot_be_empty():
+    with pytest.raises(ValidationError, match="default"):
+        _validate(lambda d: d["selection"].update(default=[]))

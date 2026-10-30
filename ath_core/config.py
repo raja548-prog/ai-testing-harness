@@ -22,8 +22,25 @@ from ath_core.assets import asset_path
 
 DEFAULT_SKILLS_DIR = asset_path("skills")
 # Flags that make an agent CLI approve every tool call. ATH never runs a session with them:
-# a prompt-injected log line could otherwise run commands unchallenged.
-AUTO_APPROVE_FLAGS = ("--yolo", "--always-approve", "bypassPermissions", "--dangerously-skip-permissions")
+# a prompt-injected log line could otherwise run commands unchallenged. Matched as substrings of every
+# argument (command, sessionArgs, resumeArgs) and of setEnv names and values.
+AUTO_APPROVE_FLAGS = ("yolo", "--always-approve", "bypassPermissions", "dangerously-skip-permissions",
+                      "acceptEdits", "--full-auto", "auto-approve", "auto_approve")
+# Arguments that auto-approve only as a whole word (`-y`), or as the value of a permission-mode flag.
+AUTO_APPROVE_ARGS = ("-y",)
+AUTO_APPROVE_MODES = ("auto", "bypassPermissions", "acceptEdits", "yolo")
+
+
+def auto_approve_args(args: list[str]) -> list[str]:
+    """The arguments that would make the agent CLI approve tool calls by itself."""
+    found = [a for a in args if a in AUTO_APPROVE_ARGS or any(f in a for f in AUTO_APPROVE_FLAGS)]
+    for i, arg in enumerate(args):
+        name, eq, value = arg.partition("=")
+        if name in ("--permission-mode", "--approval-mode"):
+            value = value if eq else (args[i + 1] if i + 1 < len(args) else "")
+            if value in AUTO_APPROVE_MODES and arg not in found:
+                found.append(f"{name} {value}" if not eq else arg)
+    return found
 
 
 class _Model(BaseModel):
@@ -64,9 +81,11 @@ class AgentRunnerConfig(_Model):
     @model_validator(mode="after")
     def _placeholder_matches_prompt_via(self) -> "AgentRunnerConfig":
         joined = " ".join(self.command)
-        auto_approve = [f for f in AUTO_APPROVE_FLAGS if any(f in arg for arg in self.command)]
-        if auto_approve:
-            raise ValueError(f"agent CLI must not auto-approve tool calls; remove {auto_approve} from command")
+        for where, args in (("command", self.command), ("sessionArgs", self.session_args),
+                            ("resumeArgs", self.resume_args),
+                            ("setEnv", [x for kv in self.set_env.items() for x in kv])):
+            if auto_approve := auto_approve_args(args):
+                raise ValueError(f"agent CLI must not auto-approve tool calls; remove {auto_approve} from {where}")
         if self.timeout_resumes and not any("{session_id}" in a for a in self.resume_args):
             raise ValueError("timeoutResumes needs resumeArgs with a {session_id} placeholder")
         if self.quorum and self.quorum > self.voters:
@@ -82,14 +101,14 @@ class AgentRunnerConfig(_Model):
 
 class HarnessConfig(_Model):
     agent_runner: AgentRunnerConfig | None = Field(None, alias="agentRunner")
+    skills_dir: Path = Field(DEFAULT_SKILLS_DIR, alias="skillsDir")
+    model_policy: Path | None = Field(None, alias="modelPolicy")  # default: config/model-policy.yaml of the install
+    source: Path | None = Field(None, exclude=True)
 
     @property
     def quorum(self) -> int | None:
         """agentRunner.quorum, or None for the default (see ath_core.triage.voting.default_quorum)."""
         return self.agent_runner.quorum if self.agent_runner else None
-    skills_dir: Path = Field(DEFAULT_SKILLS_DIR, alias="skillsDir")
-    model_policy: Path | None = Field(None, alias="modelPolicy")  # default: config/model-policy.yaml of the install
-    source: Path | None = Field(None, exclude=True)
 
 
 def config_candidates(explicit: str | Path | None = None) -> list[Path]:

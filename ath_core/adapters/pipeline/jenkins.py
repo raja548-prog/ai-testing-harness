@@ -70,7 +70,6 @@ class _Jenkins:
     params: dict[str, Any]
     transport: httpx.BaseTransport | None = None  # tests inject httpx.MockTransport
     unstable_is_success = False                   # UNSTABLE means "tests failed" for suites
-    _attempts: dict[tuple[str, str, str], int] = {}
 
     # ------------------------------------------------------------- configuration
     def config_problems(self) -> list[str]:
@@ -164,9 +163,8 @@ class _Jenkins:
         except ValueError:
             jobs = {}
         short = self._job.strip("/").split("/")[-1]
+        # Only our job's entry: another job behind the same token has its own queue and build numbers.
         entry = jobs.get(self._job.strip("/")) or jobs.get(short)
-        if entry is None and len(jobs) == 1:
-            entry = next(iter(jobs.values()))
         if not entry or not entry.get("triggered"):
             raise AdapterError(f"jenkins webhook did not trigger {self._job}: {sorted(jobs) or 'no jobs'}",
                                retryable=False)
@@ -174,16 +172,19 @@ class _Jenkins:
         return int(qid) if qid is not None else _queue_id(str(entry.get("url", "")))
 
     def _find(self, c: httpx.Client, key: str) -> dict[str, Any] | None:
-        """Locate a queued or recent build carrying this ATH_KEY."""
+        """Locate a queued or recent build carrying this ATH_KEY.
+
+        The queue is read first: an item that leaves the queue between the two reads is then already
+        in the build list. Read the other way round, it would be in neither and get triggered twice."""
+        queue = self._json(c, "/queue/api/json", tree="items[id,actions[parameters[name,value]]]")
+        for item in (queue or {}).get("items") or []:
+            if _parameters(item).get("ATH_KEY") == key:
+                return {"queue_id": int(item["id"])}
         job = self._json(c, f"{_job_path(self._job)}/api/json",
                          tree=f"builds[number,actions[parameters[name,value]]]{{0,{RECENT_BUILDS}}}")
         for b in (job or {}).get("builds") or []:
             if _parameters(b).get("ATH_KEY") == key:
                 return {"build": int(b["number"])}
-        queue = self._json(c, "/queue/api/json", tree="items[id,actions[parameters[name,value]]]")
-        for item in (queue or {}).get("items") or []:
-            if _parameters(item).get("ATH_KEY") == key:
-                return {"queue_id": int(item["id"])}
         return None
 
     # ------------------------------------------------------------- follow
@@ -246,8 +247,9 @@ def _queue_id(url: str) -> int | None:
 class JenkinsJob(_Jenkins, PipelineAdapter):
     """CI/CD job, e.g. the CD job that deploys a commit to the UAT environment."""
 
-    def trigger(self, ctx: RunContext, commit: str, extra: dict[str, Any] | None = None) -> ExecutionHandle:
-        return self._start(ctx, self._job, commit, 0, extra)
+    def trigger(self, ctx: RunContext, commit: str, extra: dict[str, Any] | None = None,
+                attempt: int = 0) -> ExecutionHandle:
+        return self._start(ctx, self._job, commit, attempt, extra)
 
     def poll(self, handle: ExecutionHandle) -> ExecStatus:
         return self._poll(handle)
@@ -268,12 +270,15 @@ class JenkinsSuiteExecutor(_Jenkins, ExecutorAdapter):
             problems.append("jenkins-job: collect=artifacts needs an 'artifacts' glob")
         return problems
 
-    def start(self, suite: str, ctx: RunContext, commit: str) -> ExecutionHandle:
-        # Each start for the same run, suite and commit is a new attempt (T7 flaky retries).
-        k = (ctx.run_id, suite, commit)
-        attempt = _Jenkins._attempts.get(k, 0)
-        _Jenkins._attempts[k] = attempt + 1
+    def start(self, suite: str, ctx: RunContext, commit: str, attempt: int = 0) -> ExecutionHandle:
+        # The orchestrator numbers attempts (0, then 1.. for T7 flaky reruns), so after a restart or a
+        # resume the same attempt finds its existing build through ATH_KEY instead of triggering again.
         return self._start(ctx, suite, commit, attempt)
+
+    def complete(self, handle: ExecutionHandle) -> bool:
+        # SUCCESS: all passed; UNSTABLE: tests failed. FAILURE, ABORTED, NOT_BUILT: the job stopped
+        # or broke, so its test report may cover only the tests that ran before.
+        return handle.meta.get("result") in (None, "SUCCESS", "UNSTABLE")
 
     def poll(self, handle: ExecutionHandle) -> ExecStatus:
         return self._poll(handle)

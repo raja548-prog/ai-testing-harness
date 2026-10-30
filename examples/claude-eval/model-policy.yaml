@@ -1,0 +1,20 @@
+# Model policy for the synthetic triage evals only (see ath-config.yaml next to this file).
+# Same as config/model-policy.yaml, except that Claude models may also receive restricted and
+# internal data. Real runs use the platform policy, which does not allow this.
+
+dataClasses:
+  restricted:
+    allowed: ["local/*", "onprem-*", "claude-*"]
+  internal:
+    allowed: ["local/*", "onprem-*", "claude-*"]
+  public:
+    allowed: ["**"]                 # any model: `*` would stop at a `/`
+
+stages:
+  impact: internal
+  author: internal
+  triage: restricted
+  remediate: restricted
+  validate: restricted
+
+productOverrides: {}

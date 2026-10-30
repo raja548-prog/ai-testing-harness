@@ -22,7 +22,7 @@ ainxt-ath/
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[server,dev]"
-pytest                                   # 138 tests, no network needed
+pytest                                   # no network needed
 
 ainxt-ath doctor examples/settlenxt/test-profile.local.yaml
 ainxt-ath run --profile examples/settlenxt/test-profile.local.yaml \

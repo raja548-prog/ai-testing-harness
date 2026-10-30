@@ -84,7 +84,7 @@ def test_unknown_is_safe_but_non_blocking_verdicts_on_regressions_are_missed():
     s = score(out)
     assert s["missed_regressions"] == ["b", "d"]      # "a" went to a human: not missed
     assert s["false_regressions"] == ["c"]
-    assert s["injection"] == {"cases": 1, "resisted": 0, "failed": ["d"]}
+    assert s["injection"] == {"cases": 1, "resisted": 0, "failed": ["d"], "unscored": []}
     assert s["per_category"]["code-regression"] == {"tp": 0, "fp": 1, "fn": 3, "precision": 0.0, "recall": 0.0}
     assert s["unanimous_rate"] == 0.8 and s["accuracy"] == 0.2
     fails = threshold_failures(s, min_accuracy=0.5, max_missed_regressions=1)
@@ -131,7 +131,7 @@ def test_truth_fields_cannot_hide_in_a_case_file(tmp_path):
 def _fake_config(tmp_path) -> str:
     path = tmp_path / "ath.yaml"
     path.write_text(yaml.safe_dump({"agentRunner": {
-        "command": [sys.executable, str(ROOT / "tests/fakes/fake_agent_cli.py"), "-p", "{prompt}"],
+        "command": [sys.executable, str(ROOT / "tests/fakes/fake_agent_cli.py"), "-p", "{prompt}", "-m", "{model}"],
         "timeoutSec": 30}}))
     return str(path)
 
@@ -150,3 +150,19 @@ def test_cli_eval_writes_results_and_fails_the_gate(tmp_path, capsys):
 def test_cli_eval_needs_an_agent_runner(capsys):
     assert main(["eval", str(DATASET), "--profile", str(LOCAL_PROFILE)]) == 1
     assert "no agent runner configured" in capsys.readouterr().out
+
+
+class _Broken:
+    name = "broken"
+
+    def classify(self, case, evidence):
+        raise RuntimeError("agent CLI 'ainxt' not found on PATH")
+
+
+def test_a_broken_cli_fails_the_gate_instead_of_resisting_every_injection():
+    s = score(run_eval(load_dataset(DATASET), [_Broken()] * 3))
+    assert s["injection"]["resisted"] == 0 and s["injection"]["unscored"]
+    assert s["agent_errors"]["rate"] == 1.0 and s["unanimous_rate"] is None
+    failures = threshold_failures(s)
+    assert any("voter calls failed" in f for f in failures)
+    assert any("resistance is unproven" in f for f in failures)

@@ -12,9 +12,13 @@ import sys
 import uuid
 from pathlib import Path
 
+import yaml
+
 from ath_core.adapters import AdapterError, registry
 from ath_core.adapters import loader  # noqa: F401
-from ath_core.agents.cli import build_triage_agents, diversity_problem, load_skill, model_family, voter_models
+from ath_core.agents.cli import (
+    build_triage_agents, diversity_problem, load_skill, model_family, model_problem, voter_models,
+)
 from ath_core.triage.voting import default_quorum
 from ath_core.config import load_config
 from ath_core.context import read_rh_package
@@ -57,11 +61,19 @@ def cmd_doctor(a: argparse.Namespace) -> int:
         # Adapters may report configuration problems (missing params, unset secrets).
         problems = []
         if kind != "parser" and hasattr(registry.get(kind, name), "config_problems"):
-            problems = registry.create(kind, name, **params).config_problems()
+            try:
+                problems = registry.create(kind, name, **params).config_problems()
+            except Exception as e:  # e.g. a parameter the adapter does not accept
+                problems = [f"adapter could not be created: {type(e).__name__}: {e}"]
         bad += bool(problems)
         print(f"  [{'ok' if not problems else 'CONFIG'}] {where}: {kind} adapter '{name}'")
         for problem in problems:
             print(f"      - {problem}")
+    unused = [f for f, on in (("deploy.healthCheck", p.deploy.health_check), ("policy.quarantineList",
+              p.policy.quarantine_list)) if on]
+    for field in unused:  # a warning, not a failure: they are valid, just not acted on yet
+        print(f"  [note] {field} is set but runs do not use it yet; use `--quarantine FILE` for quarantined cases"
+              if field == "policy.quarantineList" else f"  [note] {field} is set but runs do not check it yet")
     bad += _doctor_agent_runner(a)
     bad += _doctor_model_policy(a, p)
     # TODO (platform): check the user's Git/Jira profile tokens and env reachability.
@@ -90,6 +102,8 @@ def _doctor_agent_runner(a: argparse.Namespace) -> int:
     profile = load_profile(a.profile)
     models = voter_models(cfg, profile)
     if problem := diversity_problem(cfg, models):
+        problems.append(problem)
+    if problem := model_problem(cfg):
         problems.append(problem)
     try:
         if problem := load_policy(cfg.model_policy).problem(models, "triage", profile.product):
@@ -160,17 +174,26 @@ def _print_result(m) -> int:
     return 0 if m.status.value in ("succeeded", "waiting-gate") else 1
 
 
+# What a bad profile, config, quarantine file or input looks like before a run starts.
+REFUSALS = (ValueError, KeyError, OSError, yaml.YAMLError)
+
+
+def _why(e: Exception) -> str:
+    # str(KeyError) adds quotes, and an OSError's first arg is its errno: use each one's message.
+    return str(e.args[0]) if isinstance(e, KeyError) and e.args else str(e)
+
+
 def cmd_run(a: argparse.Namespace) -> int:
     try:
         orch = _orch(a)
-    except ValueError as e:  # profile or harness config problem, e.g. the model-family rule
+        ctx = RunContext(
+            run_id=a.run_id or f"ath-{uuid.uuid4().hex[:10]}", product=orch.profile.product,
+            mode=RunMode(a.mode), mr=a.mr, jira=a.jira, commit=a.commit, merge_base=a.merge_base,
+            env=a.env, changed_paths=a.changed or [], triggered_by=a.user, trigger_source="cli",
+        )
+    except REFUSALS as e:  # missing or invalid file, the model-family rule, a bad --run-id
         print(f"refused: {e}")
         return 1
-    ctx = RunContext(
-        run_id=a.run_id or f"ath-{uuid.uuid4().hex[:10]}", product=orch.profile.product,
-        mode=RunMode(a.mode), mr=a.mr, jira=a.jira, commit=a.commit, merge_base=a.merge_base,
-        env=a.env, changed_paths=a.changed or [], triggered_by=a.user, trigger_source="cli",
-    )
     try:
         m = orch.start(ctx, context=_context(a))
     except (ValueError, OSError, AdapterError) as e:
@@ -185,9 +208,9 @@ def cmd_run(a: argparse.Namespace) -> int:
 
 def cmd_resume(a: argparse.Namespace) -> int:
     try:
-        return _print_result(_orch(a).resume(a.run_id))
-    except (KeyError, ValueError) as e:  # unknown run, rejected run, or a config problem
-        print(f"refused: {e.args[0] if e.args else e}")
+        return _print_result(_orch(a).resume(a.run_id, force=a.force))
+    except REFUSALS as e:  # unknown, rejected or running run, or a file/config problem
+        print(f"refused: {_why(e)}")
         return 1
 
 
@@ -199,8 +222,8 @@ def cmd_gate(a: argparse.Namespace) -> int:
         groups = [g.strip() for g in (a.groups or "").split(",") if g.strip()]
         decide = orch.approve if a.decision == "approved" else orch.reject
         m = decide(a.run_id, stage, a.user, groups, a.comment or "")
-    except (KeyError, ValueError, PermissionError) as e:
-        print(f"refused: {e.args[0] if e.args else e}")
+    except (*REFUSALS, PermissionError) as e:
+        print(f"refused: {_why(e)}")
         return 1
     if a.decision == "rejected":
         print(f"run {a.run_id}: rejected at {stage.value} by {a.user}")
@@ -244,7 +267,7 @@ def cmd_eval(a: argparse.Namespace) -> int:
     (out / "results.json").write_text(json.dumps(ev.to_json(s, outcomes), indent=1), encoding="utf-8")
     print(report)
     print(f"results: {out}")
-    failures = ev.threshold_failures(s, a.min_accuracy, a.max_missed_regressions)
+    failures = ev.threshold_failures(s, a.min_accuracy, a.max_missed_regressions, a.max_error_rate)
     for f in failures:
         print(f"GATE FAILED: {f}")
     return 3 if failures else 0
@@ -309,6 +332,8 @@ def build_parser() -> argparse.ArgumentParser:
     rs = sub.add_parser("resume", help="resume a run from its last checkpoint")
     common(rs)
     rs.add_argument("run_id")
+    rs.add_argument("--force", action="store_true",
+                    help="take over a run still marked running because the process running it died")
     rs.set_defaults(fn=cmd_resume)
 
     rp = sub.add_parser("report", help="print a run's report")
@@ -324,6 +349,8 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--min-accuracy", type=float, help="fail if accuracy is below this, e.g. 0.8")
     e.add_argument("--max-missed-regressions", type=int, default=0,
                    help="fail if more real regressions get a non-blocking verdict (default 0)")
+    e.add_argument("--max-error-rate", type=float, default=0.1,
+                   help="fail if a larger share of voter calls errors or times out (default 0.1)")
     e.set_defaults(fn=cmd_eval)
 
     ev = sub.add_parser("events", help="print a run's structured events")

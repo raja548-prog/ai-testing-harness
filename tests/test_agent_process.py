@@ -17,7 +17,7 @@ posix_only = pytest.mark.skipif(os.name == "nt", reason="process groups are POSI
 def runner(mode: str, monkeypatch, **cfg) -> CliAgentRunner:
     monkeypatch.setenv("FAKE_AGENT_MODE", mode)
     return CliAgentRunner(AgentRunnerConfig(
-        command=[sys.executable, FAKE, "-p", "{prompt}"], passEnv=["FAKE_AGENT_MODE", "FAKE_AGENT_PIDS"], **cfg))
+        command=[sys.executable, FAKE, "-p", "{prompt}", "-m", "{model}"], passEnv=["FAKE_AGENT_MODE", "FAKE_AGENT_PIDS"], **cfg))
 
 
 def _alive(pid: int) -> bool:
@@ -79,7 +79,7 @@ def test_resumes_are_capped(monkeypatch):
 
 def test_resume_needs_a_session_placeholder():
     with pytest.raises(ValueError, match="resumeArgs with a {session_id}"):
-        AgentRunnerConfig(command=["ainxt", "-p", "{prompt}"], timeoutResumes=1, resumeArgs=["-c"])
+        AgentRunnerConfig(command=["ainxt", "-p", "{prompt}", "-m", "{model}"], timeoutResumes=1, resumeArgs=["-c"])
 
 
 def test_last_call_is_an_audit_record_without_content(monkeypatch):

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import time
 
 import pytest
 import yaml
@@ -69,12 +70,12 @@ def test_timeout(mode):
     mode("sleep")
     with pytest.raises(AgentError, match="timed out"):
         CliAgentRunner(AgentRunnerConfig.model_construct(
-            command=[sys.executable, FAKE, "-p", "{prompt}"], prompt_via="arg", timeout_sec=1,
+            command=[sys.executable, FAKE, "-p", "{prompt}", "-m", "{model}"], prompt_via="arg", timeout_sec=1,
             pass_env=["FAKE_AGENT_MODE"], voters=1, models=[])).run(SKILL, {"case": "{}"})
 
 
 def test_missing_cli_is_agent_error():
-    r = CliAgentRunner(AgentRunnerConfig(command=["no-such-ainxt-cli", "-p", "{prompt}"]))
+    r = CliAgentRunner(AgentRunnerConfig(command=["no-such-ainxt-cli", "-p", "{prompt}", "-m", "{model}"]))
     with pytest.raises(AgentError, match="not found"):
         r.run(SKILL, {"case": "{}"})
 
@@ -130,7 +131,7 @@ def test_config_lookup_order(tmp_path, monkeypatch):
 
 def test_voters_use_profile_model_or_configured_models():
     profile = load_profile(ROOT / "examples/settlenxt/test-profile.yaml")
-    cfg = HarnessConfig(agentRunner=AgentRunnerConfig(command=["ainxt", "-p", "{prompt}"]))
+    cfg = HarnessConfig(agentRunner=AgentRunnerConfig(command=["ainxt", "-p", "{prompt}", "-m", "{model}"]))
     assert [a.model for a in build_triage_agents(cfg, profile)] == ["local/onprem-reasoner"] * 3
     cfg.agent_runner.models = ["onprem-a", "onprem-b"]
     assert [a.model for a in build_triage_agents(cfg, profile)] == ["onprem-a", "onprem-b", "onprem-a"]
@@ -140,7 +141,7 @@ def test_triage_agent_masks_before_sending(mode):
     mode("echo")
     profile = load_profile(LOCAL_PROFILE)
     cfg = HarnessConfig(agentRunner=AgentRunnerConfig(
-        command=[sys.executable, FAKE, "-p", "{prompt}"], passEnv=["FAKE_AGENT_MODE"], voters=1))
+        command=[sys.executable, FAKE, "-p", "{prompt}", "-m", "{model}"], passEnv=["FAKE_AGENT_MODE"], voters=1))
     agent = build_triage_agents(cfg, profile)[0]
     case = ATRFCase(id="SNX-009", name="t", suite="smoke", status=CaseStatus.FAILED)
     agent.classify(case, {"logs": ["card 4111 1111 1111 1111 declined"]})
@@ -180,7 +181,7 @@ def test_cli_run_and_doctor_with_config(mode, tmp_path, capsys):
 
 def test_doctor_flags_missing_cli(tmp_path, capsys):
     path = tmp_path / "ath.yaml"
-    path.write_text(yaml.safe_dump({"agentRunner": {"command": ["no-such-ainxt-cli", "-p", "{prompt}"]}}))
+    path.write_text(yaml.safe_dump({"agentRunner": {"command": ["no-such-ainxt-cli", "-p", "{prompt}", "-m", "{model}"]}}))
     assert main(["doctor", str(LOCAL_PROFILE), "--config", str(path)]) == 2
     assert "not found on PATH" in capsys.readouterr().out
 
@@ -221,7 +222,7 @@ def test_set_env_values_reach_cli(mode):
                                    ["--permission-mode=bypassPermissions"]])
 def test_auto_approve_flags_are_refused(flags):
     with pytest.raises(ValueError, match="auto-approve"):
-        AgentRunnerConfig(command=["ainxt", *flags, "-p", "{prompt}"])
+        AgentRunnerConfig(command=["ainxt", *flags, "-p", "{prompt}", "-m", "{model}"])
 
 
 def test_example_ainxt_config_is_valid(capsys, monkeypatch):
@@ -337,7 +338,7 @@ def test_quote_matching_rules(quote, ok):
 
 def _families_cfg(models, min_families=2) -> HarnessConfig:
     return HarnessConfig(agentRunner=AgentRunnerConfig(
-        command=["ainxt", "-p", "{prompt}"], models=models, minFamilies=min_families,
+        command=["ainxt", "-p", "{prompt}", "-m", "{model}"], models=models, minFamilies=min_families,
         modelFamilies={"onprem-llama*": "meta", "onprem-qwen*": "qwen", "claude-*": "anthropic"}))
 
 
@@ -356,20 +357,20 @@ def test_family_rule_fails_closed(models, match):
 
 def test_quorum_cannot_exceed_voters():
     with pytest.raises(ValueError, match="quorum"):
-        AgentRunnerConfig(command=["ainxt", "-p", "{prompt}"], voters=3, quorum=4)
-    cfg = HarnessConfig(agentRunner=AgentRunnerConfig(command=["ainxt", "-p", "{prompt}"], voters=5, quorum=4))
+        AgentRunnerConfig(command=["ainxt", "-p", "{prompt}", "-m", "{model}"], voters=3, quorum=4)
+    cfg = HarnessConfig(agentRunner=AgentRunnerConfig(command=["ainxt", "-p", "{prompt}", "-m", "{model}"], voters=5, quorum=4))
     assert cfg.quorum == 4 and HarnessConfig().quorum is None
 
 
 def test_min_families_cannot_exceed_voters():
     with pytest.raises(ValueError, match="cannot exceed voters"):
-        AgentRunnerConfig(command=["ainxt", "-p", "{prompt}"], voters=2, minFamilies=3)
+        AgentRunnerConfig(command=["ainxt", "-p", "{prompt}", "-m", "{model}"], voters=2, minFamilies=3)
 
 
 def test_cli_refuses_run_and_doctor_explains_family_rule(tmp_path, capsys):
     path = tmp_path / "ath.yaml"
     path.write_text(yaml.safe_dump({"agentRunner": {
-        "command": [sys.executable, FAKE, "-p", "{prompt}"], "models": ["onprem-llama-70b"],
+        "command": [sys.executable, FAKE, "-p", "{prompt}", "-m", "{model}"], "models": ["onprem-llama-70b"],
         "minFamilies": 2, "modelFamilies": {"onprem-llama*": "meta"}}}))
     rc = main(["run", "--profile", str(LOCAL_PROFILE), "--config", str(path), "--db", ":memory:",
                "--commit", "mr001", "--merge-base", "base000", "--env", "uat1"])
@@ -382,3 +383,36 @@ def test_cli_refuses_run_and_doctor_explains_family_rule(tmp_path, capsys):
 def test_doctor_notes_single_family_voters(mode, tmp_path, capsys):
     assert main(["doctor", str(LOCAL_PROFILE), "--config", _config_file(tmp_path)]) == 0
     assert "votes are correlated" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("cfg", [
+    {"sessionArgs": ["--session-id", "{session_id}", "--yolo"]},
+    {"resumeArgs": ["-r", "{session_id}", "--dangerously-skip-permissions"]},
+    {"setEnv": {"AINXT_PERMISSION_MODE": "bypassPermissions"}},
+    {"command": ["gemini", "-y", "-p", "{prompt}", "-m", "{model}"]},
+    {"command": ["claude", "--permission-mode", "auto", "-p", "{prompt}", "--model", "{model}"]},
+    {"command": ["claude", "--permission-mode=acceptEdits", "-p", "{prompt}", "--model", "{model}"]},
+])
+def test_auto_approve_is_refused_anywhere_in_the_session(cfg):
+    with pytest.raises(ValueError, match="auto-approve"):
+        AgentRunnerConfig(**{"command": ["ainxt", "-p", "{prompt}", "-m", "{model}"], **cfg})
+
+
+def test_safe_permission_modes_are_allowed():
+    AgentRunnerConfig(command=["claude", "--permission-mode", "plan", "-p", "{prompt}", "--model", "{model}"])
+
+
+def test_command_without_model_placeholder_is_refused():
+    cfg = HarnessConfig(agentRunner=AgentRunnerConfig(command=["ainxt", "-p", "{prompt}"], models=["local/x"]))
+    with pytest.raises(ValueError, match="no {model} placeholder"):
+        build_triage_agents(cfg, load_profile(LOCAL_PROFILE))
+
+
+def test_stdin_prompt_the_cli_never_reads_still_times_out():
+    # The CLI never reads stdin and the prompt is far bigger than a pipe buffer.
+    r = CliAgentRunner(AgentRunnerConfig(command=[sys.executable, "-c", "import time; time.sleep(30)"],
+                                         promptVia="stdin", timeoutSec=1))
+    started = time.monotonic()
+    with pytest.raises(AgentError, match="timed out"):
+        r.run(SKILL, {"logs": "x" * 2_000_000})
+    assert time.monotonic() - started < 10

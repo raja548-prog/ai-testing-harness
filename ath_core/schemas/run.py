@@ -54,7 +54,8 @@ def utcnow() -> datetime:
 
 class RunContext(BaseModel):
     """Inputs of a run. Fixed once the run starts."""
-    run_id: str
+    # Used in file names (reports) and URLs: no path separators, no leading dot.
+    run_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
     product: str
     mode: RunMode = RunMode.REPORT_ONLY
     mr: str | None = None

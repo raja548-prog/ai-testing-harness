@@ -34,10 +34,15 @@ def _person(user: str) -> str | None:
     return None
 
 
+def _same_person(a: str, b: str) -> bool:
+    # SSO ids and emails are case-insensitive: `Alice@corp` is the `alice@corp` who triggered the run.
+    return a.strip().casefold() == b.strip().casefold()
+
+
 def approval_problem(m: RunManifest, stage: Stage, user: str, groups: list[str], owners: list[str]) -> str | None:
     if p := _waiting(m, stage) or _person(user):
         return p
-    if user == m.context.triggered_by:
+    if _same_person(user, m.context.triggered_by):
         return (f"{user} triggered this run and ATH acted on their behalf, so they cannot approve its gates; "
                 f"another member of {owners} must (separation of duties)")
     if not set(groups) & set(owners):
@@ -50,6 +55,6 @@ def approval_problem(m: RunManifest, stage: Stage, user: str, groups: list[str],
 def rejection_problem(m: RunManifest, stage: Stage, user: str, groups: list[str], owners: list[str]) -> str | None:
     if p := _waiting(m, stage) or _person(user):
         return p
-    if user != m.context.triggered_by and not set(groups) & set(owners):
+    if not _same_person(user, m.context.triggered_by) and not set(groups) & set(owners):
         return f"{user} neither triggered this run nor is in an owning group of {m.context.product} ({owners})"
     return None

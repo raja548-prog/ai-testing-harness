@@ -26,7 +26,7 @@ from ath_core.gates import approval_problem, rejection_problem
 from ath_core.masking import Masker
 from ath_core.report.markdown import render_report
 from ath_core.schemas.atrf import ATRFCase, ATRFRun, Triage, TriageCategory
-from ath_core.schemas.profile import TestProfile
+from ath_core.schemas.profile import SuiteConfig, TestProfile
 from ath_core.schemas.run import (
     GateDecision, RunContext, RunManifest, RunMode, RunStatus, Stage, StageResult, StageStatus, utcnow,
 )
@@ -71,27 +71,31 @@ class Orchestrator:
     # ---------------------------------------------------------------- public API
     def start(self, ctx: RunContext, context: dict[str, str] | None = None) -> RunManifest:
         """Start (or continue) a run. `context` holds change context for LLM stages:
-        {"diff": unified diff, "tsd": TSD markdown}. It is masked and stored with the run."""
-        self._guard(ctx)
-        m = self.store.load_manifest(ctx.run_id)
-        if m is None:
-            m = RunManifest(context=ctx, core_version=CORE_VERSION, package_version=self.package_version,
-                            profile_hash=self._profile_hash(), profile_ref=self.profile_ref)
-            for name, text in (context or {}).items():
-                masked = self.masker.mask(text)
-                self.store.put_artifact(ctx.run_id, f"context/{name}", masked)
-                m.inputs[name] = hashlib.sha256(masked.encode()).hexdigest()
-        return self._execute(m)
+        {"diff": unified diff, "tsd": TSD markdown}. It is masked and stored with the run.
 
-    def resume(self, run_id: str) -> RunManifest:
-        m = self._load(run_id)
-        if m.status == RunStatus.REJECTED:
-            raise ValueError(f"run {run_id} was rejected at a gate and cannot be resumed")
-        return self._execute(m)
+        An existing run id continues that run only if `ctx` is the same; rejected runs stay stopped."""
+        self.check(ctx)
+        m = RunManifest(context=ctx, core_version=CORE_VERSION, package_version=self.package_version,
+                        profile_hash=self._profile_hash(), profile_ref=self.profile_ref)
+        masked = {name: self.masker.mask(text) for name, text in (context or {}).items()}
+        m.inputs = {name: hashlib.sha256(text.encode()).hexdigest() for name, text in masked.items()}
+        if self.store.create_manifest(m):
+            for name, text in masked.items():
+                self.store.put_artifact(ctx.run_id, f"context/{name}", text)
+        elif self._load(ctx.run_id).context != ctx:
+            raise ValueError(f"run {ctx.run_id} already exists with different inputs; resume it, "
+                             f"or start a new run with another run id")
+        return self._execute(ctx.run_id)
+
+    def resume(self, run_id: str, force: bool = False) -> RunManifest:
+        """Continue a run from its checkpoints. `force` takes over a run left RUNNING by a process that died."""
+        self._load(run_id)  # KeyError for an unknown run
+        return self._execute(run_id, force=force)
 
     def approve(self, run_id: str, stage: Stage, user: str, groups: list[str], comment: str = "") -> RunManifest:
         """Record an approval (separation of duties applies), then continue the run past the gate."""
-        return self._execute(self.record_gate(run_id, stage, "approved", user, groups, comment))
+        self.record_gate(run_id, stage, "approved", user, groups, comment)
+        return self._execute(run_id)
 
     def reject(self, run_id: str, stage: Stage, user: str, groups: list[str], comment: str = "") -> RunManifest:
         """Stop the run at a gate. Artifacts are kept; the env hold is released."""
@@ -101,22 +105,26 @@ class Orchestrator:
                     comment: str = "") -> RunManifest:
         """Check and record a gate decision without running anything (the API resumes in the background).
 
-        Raises PermissionError when the decider may not decide, ValueError if the profile changed."""
-        m = self._load(run_id)
-        if m.profile_hash != self._profile_hash():
-            raise ValueError(f"the profile changed since run {run_id} started; decide with the profile it ran with")
+        Raises PermissionError when the decider may not decide, ValueError if the profile changed.
+        Check and write are one atomic step, so concurrent decisions cannot both pass."""
         rule = approval_problem if decision == "approved" else rejection_problem
-        if problem := rule(m, stage, user, groups, self.profile.owners):
-            raise PermissionError(problem)
-        m.gates.append(GateDecision(stage=stage, decision=decision, by=user, groups=groups, comment=comment))
+
+        def decide(m: RunManifest) -> None:
+            if m.profile_hash != self._profile_hash():
+                raise ValueError(f"the profile changed since run {run_id} started; decide with the profile it ran with")
+            if problem := rule(m, stage, user, groups, self.profile.owners):
+                raise PermissionError(problem)
+            m.gates.append(GateDecision(stage=stage, decision=decision, by=user, groups=groups, comment=comment))
+            if decision == "rejected":
+                res = m.stages[stage]
+                res.status, res.error, res.finished_at = StageStatus.REJECTED, f"rejected by {user}: {comment}", utcnow()
+                m.status = RunStatus.REJECTED
+
+        m = self.store.update_manifest(run_id, decide)
         self.store.event(run_id, stage.value, f"gate.{decision}", by=user, groups=groups, comment=comment)
         if decision == "rejected":
-            res = m.stages[stage]
-            res.status, res.error, res.finished_at = StageStatus.REJECTED, f"rejected by {user}: {comment}", utcnow()
-            self.store.checkpoint(run_id, res)
-            m.status = RunStatus.REJECTED
+            self.store.checkpoint(run_id, m.stages[stage])
             self._release_env(m.context)
-        self.store.save_manifest(m)
         return m
 
     def _load(self, run_id: str) -> RunManifest:
@@ -144,16 +152,41 @@ class Orchestrator:
             plan += [(Stage.T10_REMEDIATE, self.t10_remediate), (Stage.T11_VALIDATE, self.t11_validate)]
         return plan
 
-    def _execute(self, m: RunManifest) -> RunManifest:
+    def _claim(self, run_id: str, force: bool) -> tuple[RunManifest, RunStatus]:
+        """Mark the run RUNNING, atomically, so two processes never execute it at once."""
+        before: list[RunStatus] = []
+
+        def claim(m: RunManifest) -> None:
+            if m.status == RunStatus.REJECTED:
+                raise ValueError(f"run {run_id} was rejected at a gate and cannot be resumed")
+            if m.status == RunStatus.RUNNING and not force:
+                raise ValueError(f"run {run_id} is already running; if its process died, resume it with --force")
+            before.append(m.status)
+            m.status = RunStatus.RUNNING
+
+        m = self.store.update_manifest(run_id, claim)
+        return m, before[0]
+
+    def _execute(self, run_id: str, force: bool = False) -> RunManifest:
+        m, before = self._claim(run_id, force)
         ctx = m.context
         self._m = m  # stage functions read gate decisions from it
-        m.status = RunStatus.RUNNING
-        self.store.save_manifest(m)
+        self._atrf, self._baseline = {}, {}  # per-run state: an orchestrator may run several runs
+        self.masker.hits.clear()
+        plan = self._plan(ctx.mode)
+        done = {s: cp for s, _ in plan
+                if (cp := self.store.get_checkpoint(ctx.run_id, s)) and cp.status in (StageStatus.DONE, StageStatus.SKIPPED)}
+        # A failed (or crashed) run gave up its env hold, and another run may have deployed since:
+        # if stages that use the env are left, take the hold again and redeploy.
+        uses_env = {Stage.T5_EXECUTE, Stage.T7_TRIAGE, Stage.T10_REMEDIATE, Stage.T11_VALIDATE}
+        env_left = any(s in uses_env and s not in done for s, _ in plan)
+        if before in (RunStatus.FAILED, RunStatus.RUNNING) and Stage.T4_ENV in done and env_left:
+            del done[Stage.T4_ENV]
+            self.store.event(ctx.run_id, "T4", "env.redeploy", reason=f"resuming a {before.value} run")
         try:
-            for stage, fn in self._plan(ctx.mode):
-                done = self.store.get_checkpoint(ctx.run_id, stage)
-                if done and done.status in (StageStatus.DONE, StageStatus.SKIPPED):
-                    m.stages[stage] = done
+            for stage, fn in plan:
+                if stage in done:
+                    m.stages[stage] = done[stage]
                     self._rehydrate(ctx, stage)
                     continue
                 res = StageResult(stage=stage, status=StageStatus.RUNNING, started_at=utcnow())
@@ -193,7 +226,8 @@ class Orchestrator:
             if m.status in (RunStatus.SUCCEEDED, RunStatus.FAILED):
                 self._release_env(ctx)
 
-    def _guard(self, ctx: RunContext) -> None:
+    def check(self, ctx: RunContext) -> None:
+        """Refuse a run this profile does not allow (wrong product, environment not in policy)."""
         if ctx.product != self.profile.product:
             raise ValueError(f"run is for {ctx.product!r} but profile is {self.profile.product!r}")
         if ctx.env not in self.profile.policy.environments:
@@ -206,13 +240,21 @@ class Orchestrator:
                 body = self.store.get_artifact(ctx.run_id, f"atrf/{suite}.json")
                 if body:
                     self._atrf[suite] = ATRFRun.model_validate_json(body)
-                base = self.store.get_baseline(ctx.product, ctx.merge_base, suite)
-                if base:
-                    self._baseline[suite] = ATRFRun.model_validate_json(base)
+                if (base := self._load_baseline(ctx, suite)) is not None:
+                    self._baseline[suite] = base
 
     def _selected(self, ctx: RunContext) -> list[str]:
         cp = self.store.get_checkpoint(ctx.run_id, Stage.T2_SELECT)
         return cp.output["suites"] if cp else []
+
+    def _incomplete(self, ctx: RunContext) -> list[str]:
+        """Suites whose MR run stopped early in T5, so their results may be partial."""
+        cp = self.store.get_checkpoint(ctx.run_id, Stage.T5_EXECUTE)
+        return cp.output.get("incomplete", []) if cp else []
+
+    def _load_baseline(self, ctx: RunContext, suite: str) -> ATRFRun | None:
+        body = self.store.get_baseline(ctx.product, ctx.merge_base, suite)
+        return ATRFRun.model_validate_json(body) if body else None
 
     # ---------------------------------------------------------------- stages
     def t1_impact(self, ctx: RunContext) -> dict[str, Any]:
@@ -238,45 +280,61 @@ class Orchestrator:
                 raise AdapterError(f"environment {ctx.env} is held by another run; queued", retryable=True)
             self.store.event(ctx.run_id, "T4", "env.hold", env=ctx.env)
         deploy = registry.create("pipeline", self.profile.deploy.adapter, **self.profile.deploy.params)
-        handle = deploy.trigger(ctx, ctx.commit)
+        redeploys = sum(k == "env.redeploy" for _, k, _ in self.store.events(ctx.run_id))
+        handle = deploy.trigger(ctx, ctx.commit, attempt=redeploys)  # a redeploy must not reuse the old job
         self.store.event(ctx.run_id, "T4", "external.call", adapter=handle.adapter, job=handle.job_ref)
         status = self._wait(lambda: deploy.poll(handle), timeout_min=60,
-                            max_interval=self.profile.deploy.params.get("pollSec", DEFAULT_POLL_SEC))
+                            max_interval=self.profile.deploy.poll_sec or DEFAULT_POLL_SEC)
         if status != ExecStatus.DONE:
             raise AdapterError(f"deploy of {ctx.commit} ended with {status.value}: env-blocked", retryable=False)
         return {"deployed": ctx.commit, "job": handle.job_ref}
 
     def t5_execute(self, ctx: RunContext) -> dict[str, Any]:
-        out: dict[str, Any] = {"suites": {}}
+        out: dict[str, Any] = {"suites": {}, "incomplete": []}
         for suite in self._selected(ctx):
             cfg = self.profile.suite(suite)
             ex = registry.create("executor", cfg.executor.adapter, **cfg.executor.params)
-            raw = self._run_suite(ex, suite, ctx, ctx.commit, cfg.max_duration_min)
+            raw, complete = self._run_suite(ex, cfg, ctx, ctx.commit)
+            if not complete:
+                out["incomplete"].append(suite)
             # Raw results are unmasked: held only until T6 parses them, then wiped. In the ATH
             # service this is an encrypted, short-TTL object rather than a state-store row.
             self.store.put_artifact(ctx.run_id, f"raw/{suite}", {k: v.decode("utf-8", "replace") for k, v in raw.files.items()})
             cached = self.store.get_baseline(ctx.product, ctx.merge_base, suite)
             if cached is None:
-                base_raw = self._run_suite(ex, suite, ctx, ctx.merge_base, cfg.max_duration_min)
-                base = self._parse(base_raw, ctx, suite, ctx.merge_base)
-                self.store.put_baseline(ctx.product, ctx.merge_base, suite, base.model_dump_json())
-                out["suites"][suite] = "baseline-run"
+                base_raw, base_complete = self._run_suite(ex, cfg, ctx, ctx.merge_base)
+                if base_complete:
+                    base = self._parse(base_raw, ctx, suite, ctx.merge_base)
+                    self.store.put_baseline(ctx.product, ctx.merge_base, suite, base.model_dump_json())
+                    out["suites"][suite] = "baseline-run"
+                else:  # never cache a partial baseline; without one, no failure is called pre-existing
+                    out["suites"][suite] = "baseline-incomplete"
             else:
                 out["suites"][suite] = "baseline-cached"
         return out
 
     def t6_normalize(self, ctx: RunContext) -> dict[str, Any]:
         out = {}
-        for suite in self._selected(ctx):
+        selected = self._selected(ctx)
+        for suite in selected:
             raw_json = self.store.get_artifact(ctx.run_id, f"raw/{suite}")
-            files = {k: v.encode() for k, v in json.loads(raw_json).items()}
-            run = self._parse(RawResults(format=self.profile.suite(suite).results.format, files=files), ctx, suite, ctx.commit)
-            run.baseline_commit = ctx.merge_base
+            parsed = self.store.get_artifact(ctx.run_id, f"atrf/{suite}.json")
+            if raw_json in (None, "{}") and parsed:
+                run = ATRFRun.model_validate_json(parsed)  # parsed by an earlier attempt, raw results already wiped
+            else:
+                files = {k: v.encode() for k, v in json.loads(raw_json or "{}").items()}
+                run = self._parse(RawResults(format=self.profile.suite(suite).results.format, files=files),
+                                  ctx, suite, ctx.commit)
+                run.baseline_commit = ctx.merge_base
+                run.incomplete = suite in self._incomplete(ctx)
+                self.store.put_artifact(ctx.run_id, f"atrf/{suite}.json", run.model_dump_json())
             self._atrf[suite] = run
-            self._baseline[suite] = ATRFRun.model_validate_json(self.store.get_baseline(ctx.product, ctx.merge_base, suite))
-            self.store.put_artifact(ctx.run_id, f"atrf/{suite}.json", run.model_dump_json())
-            self.store.put_artifact(ctx.run_id, f"raw/{suite}", "{}")  # raw results never outlive T6
+            self._baseline[suite] = self._load_baseline(ctx, suite)
             out[suite] = run.summary.model_dump()
+        # Raw results never outlive T6. Wiped only once every suite is parsed, so a resume after a
+        # failure part-way still has them.
+        for suite in selected:
+            self.store.put_artifact(ctx.run_id, f"raw/{suite}", "{}")
         out["masked"] = dict(self.masker.hits)
         return out
 
@@ -354,6 +412,7 @@ class Orchestrator:
               max_interval: float = DEFAULT_POLL_SEC) -> ExecStatus:
         """Poll until the job leaves RUNNING or the timeout passes, backing off between checks."""
         deadline = self._clock() + timeout_min * 60
+        max_interval = max(max_interval, 1.0)  # pollSec is validated, but a never-sleeping loop must not happen
         interval = min(FIRST_POLL_SEC, max_interval)
         while True:
             st = poll()
@@ -365,14 +424,16 @@ class Orchestrator:
             self._sleep(min(interval, remaining))
             interval = min(interval * POLL_BACKOFF, max_interval)
 
-    def _run_suite(self, ex, suite: str, ctx: RunContext, commit: str, max_min: int):
-        handle = ex.start(suite, ctx, commit)
+    def _run_suite(self, ex, cfg: SuiteConfig, ctx: RunContext, commit: str,
+                   attempt: int = 0) -> tuple[RawResults, bool]:
+        """Run one suite to the end. Returns its raw results and whether the job ran to completion."""
+        handle = ex.start(cfg.id, ctx, commit, attempt=attempt)
         self.store.event(ctx.run_id, "T5", "external.call", adapter=handle.adapter, job=handle.job_ref)
-        st = self._wait(lambda: ex.poll(handle), timeout_min=max_min,
-                        max_interval=self.profile.suite(suite).executor.params.get("pollSec", DEFAULT_POLL_SEC))
+        st = self._wait(lambda: ex.poll(handle), timeout_min=cfg.max_duration_min,
+                        max_interval=cfg.executor.poll_sec or DEFAULT_POLL_SEC)
         if st not in (ExecStatus.DONE, ExecStatus.FAILED):
-            raise AdapterError(f"suite {suite} on {commit} ended with {st.value}")
-        return ex.collect(handle)
+            raise AdapterError(f"suite {cfg.id} on {commit} ended with {st.value}")
+        return ex.collect(handle), ex.complete(handle)
 
     def _parse(self, raw, ctx: RunContext, suite: str, commit: str) -> ATRFRun:
         cfg = self.profile.suite(suite)
@@ -390,7 +451,7 @@ class Orchestrator:
         for attempt in range(self.profile.policy.flaky_retries):
             if not candidates - passed:
                 break
-            raw = self._run_suite(ex, suite, ctx, ctx.commit, self.profile.suite(suite).max_duration_min)
+            raw, _ = self._run_suite(ex, self.profile.suite(suite), ctx, ctx.commit, attempt=attempt + 1)
             for cid, case in self._parse(raw, ctx, suite, ctx.commit).by_id().items():
                 if cid in candidates and not case.is_failing:
                     passed.add(cid)
@@ -401,12 +462,13 @@ class Orchestrator:
         end = datetime.now(timezone.utc)
         for src in self.profile.logs.sources:
             try:
-                ls = registry.create("logs", src.adapter, **src.params)
+                ls = registry.create("logs", src.adapter, **{"product": self.profile.product, **src.params})
                 logs = ls.fetch(end - timedelta(minutes=15), end, case.correlation, 200, self.masker)
                 self.store.event(ctx.run_id, "T7", "external.call", adapter=src.adapter, case=case.id)
                 return logs
-            except (AdapterError, NotImplementedError) as e:
-                self.store.event(ctx.run_id, "T7", "logsource.fallback", adapter=src.adapter, error=str(e))
+            except Exception as e:  # any log source problem: try the next one, never fail triage over logs
+                self.store.event(ctx.run_id, "T7", "logsource.fallback", adapter=src.adapter,
+                                 error=self.masker.mask(f"{type(e).__name__}: {e}"))
         return MaskedLogs(source="none", lines=[])
 
     def _release_env(self, ctx: RunContext) -> None:

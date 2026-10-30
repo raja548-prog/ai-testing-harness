@@ -9,7 +9,8 @@ from ath_core.schemas.run import RunContext
 
 @registry.register("pipeline", "gitlab-pipeline")
 class GitLabPipeline(PipelineAdapter):
-    def trigger(self, ctx: RunContext, commit: str, extra: dict[str, Any] | None = None) -> ExecutionHandle:
+    def trigger(self, ctx: RunContext, commit: str, extra: dict[str, Any] | None = None,
+                attempt: int = 0) -> ExecutionHandle:
         # TODO: POST /projects/:id/pipeline?ref=<branch> with variables ATH_RUN_ID, COMMIT_ID
         raise NotImplementedError
 

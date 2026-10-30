@@ -5,7 +5,7 @@ import yaml
 from ath_cli.main import main
 from ath_core.agents.cli import build_triage_agents
 from ath_core.config import AgentRunnerConfig, HarnessConfig
-from ath_core.policy import load_policy
+from ath_core.policy import load_policy, model_matches
 from ath_core.schemas import load_profile
 from tests.conftest import LOCAL_PROFILE, PROD_PROFILE
 
@@ -55,7 +55,7 @@ def test_missing_policy_fails_closed(tmp_path):
 
 
 def test_triage_refused_for_cloud_voter():
-    cfg = HarnessConfig(agentRunner=AgentRunnerConfig(command=["ainxt", "-p", "{prompt}"],
+    cfg = HarnessConfig(agentRunner=AgentRunnerConfig(command=["ainxt", "-p", "{prompt}", "-m", "{model}"],
                                                       models=["claude-haiku-5-5"]))
     with pytest.raises(ValueError, match="stage 'triage' sees 'restricted' data"):
         build_triage_agents(cfg, load_profile(LOCAL_PROFILE))
@@ -64,7 +64,7 @@ def test_triage_refused_for_cloud_voter():
 def test_cli_run_refused_and_doctor_flags_policy(tmp_path, capsys):
     cfg = tmp_path / "ath.yaml"
     cfg.write_text(yaml.safe_dump({"modelPolicy": _policy(tmp_path), "agentRunner": {
-        "command": ["ainxt", "-p", "{prompt}"], "models": ["claude-haiku-5-5"]}}))
+        "command": ["ainxt", "-p", "{prompt}", "-m", "{model}"], "models": ["claude-haiku-5-5"]}}))
     rc = main(["run", "--profile", str(LOCAL_PROFILE), "--config", str(cfg), "--db", ":memory:",
                "--commit", "mr001", "--merge-base", "base000", "--env", "uat1"])
     assert rc == 1 and "refused: model policy" in capsys.readouterr().out
@@ -80,3 +80,15 @@ def test_doctor_checks_profile_stage_models(tmp_path, capsys):
     main(["doctor", str(path)])
     out = capsys.readouterr().out
     assert "[CONFIG] model policy" in out and "stage 'remediate'" in out and "'gpt-5'" in out
+
+
+@pytest.mark.parametrize("model, pattern, ok", [
+    ("onprem-llama-70b", "onprem-*", True),
+    ("onprem-proxy/openai/gpt-4o", "onprem-*", False),  # `*` stops at `/`
+    ("local/onprem-coder", "local/*", True),
+    ("local/a/b", "local/*", False),
+    ("local/a/b", "local/**", True),
+    ("claude-haiku-5-5", "**", True),
+])
+def test_policy_globs_stay_within_a_name_part(model, pattern, ok):
+    assert model_matches(model, pattern) is ok

@@ -1,6 +1,7 @@
 """Deterministic triage pre-checks (no LLM). Run before any agent sees a failure."""
 from __future__ import annotations
 
+import re
 from datetime import date
 from typing import Callable
 
@@ -19,6 +20,8 @@ def apply_prechecks(
     """Label failures that need no agent. Returns the failures still untriaged.
 
     Order matters: known failure > quarantined > pre-existing on baseline > flaky on retry.
+    Pre-existing means the baseline failed *the same way*: a test the MR breaks for a new reason
+    goes on to triage even though it already failed on the merge-base.
     """
     today = today or date.today()
     active_known = {k.case_id: k for k in known_failures if date.fromisoformat(k.expires) >= today}
@@ -32,7 +35,7 @@ def apply_prechecks(
         elif case.id in quarantined:
             case.triage = Triage(category=TriageCategory.QUARANTINED, decided_by="precheck",
                                  reason="test is on the quarantine list")
-        elif case.id in base and base[case.id].is_failing:
+        elif case.id in base and base[case.id].is_failing and signature(base[case.id]) == signature(case):
             case.triage = Triage(category=TriageCategory.PRE_EXISTING, decided_by="precheck",
                                  reason=f"also fails on merge-base {baseline.commit}")
         elif rerun_passes is not None and rerun_passes(case):
@@ -41,6 +44,21 @@ def apply_prechecks(
         else:
             remaining.append(case)
     return remaining
+
+
+# Parts of a failure message that change from run to run: ids, timestamps, hashes, amounts.
+_VOLATILE = re.compile(r"[0-9a-fA-F]{8,}|\d+")
+
+
+def signature(case: ATRFCase) -> tuple[str, str]:
+    """How a case failed, comparable across runs: failure type and the first line of the message
+    (else the trace) with numbers and ids replaced."""
+    f = case.failure
+    if f is None:
+        return ("", "")
+    text = (f.message or f.trace).strip()
+    first = text.splitlines()[0] if text else ""
+    return (f.type, " ".join(_VOLATILE.sub("#", first).split()).casefold())
 
 
 def mark_flaky(cases: list[ATRFCase], passed_on_retry: set[str]) -> list[ATRFCase]:

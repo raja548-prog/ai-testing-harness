@@ -45,6 +45,7 @@ class Triage(BaseModel):
     votes: list[str] = Field(default_factory=list)
     evidence: list[str] = Field(default_factory=list)  # verified quotes from the inputs, one per agreeing vote
     notes: list[str] = Field(default_factory=list)     # why votes were discarded or came back unknown
+    errors: int = 0  # votes whose agent call failed (CLI error, timeout, no usable output)
 
 
 class ATRFCase(BaseModel):

@@ -1,0 +1,33 @@
+# Harness config for scoring the T7 triage voters with Claude Code (`claude -p`) on the SYNTHETIC
+# eval dataset in tests/evals/triage. Evals only: its model policy lets Claude models see
+# `restricted` data. Never use it for real runs, and never copy it to .ath/config.yaml or
+# ~/.config/ainxt/ath.yaml (runs pick those up automatically).
+#
+#   ainxt-ath doctor examples/settlenxt/test-profile.local.yaml --config examples/claude-eval/ath-config.yaml
+#   ainxt-ath eval tests/evals/triage --profile examples/settlenxt/test-profile.local.yaml \
+#     --config examples/claude-eval/ath-config.yaml
+#
+# Auth: an existing `claude` login is reused (HOME is passed), or set ANTHROPIC_API_KEY.
+
+agentRunner:
+  command:
+    - claude
+    - -p                          # headless: prompt on stdin, the answer as plain text on stdout
+    - --model
+    - "{model}"
+    - --tools
+    - ""                          # no tools at all: triage only reads the prompt
+    - --strict-mcp-config         # no MCP servers from your own settings
+    - --setting-sources
+    - project                     # skip your user settings and hooks; the empty workdir has no project ones
+    - --no-session-persistence    # nothing saved under ~/.claude for these throwaway sessions
+  # Keep the default text output: `--output-format json` puts the answer in a `result` field,
+  # which ATH does not unwrap.
+  promptVia: stdin
+  timeoutSec: 180
+  voters: 3
+  models: [claude-sonnet-5-5, claude-opus-5-5, claude-haiku-5-5]   # one per voter
+  modelFamilies: { "claude-*": anthropic }                          # one family: votes are correlated
+  passEnv: [ANTHROPIC_API_KEY]
+
+modelPolicy: model-policy.yaml
