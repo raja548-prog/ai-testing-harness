@@ -1,4 +1,4 @@
-"""Multi-agent classification and the 2-of-3 rule (T7 agents, T8 verify)."""
+"""Multi-agent classification and the quorum rule (T7 agents, T8 verify)."""
 from __future__ import annotations
 
 from collections import Counter
@@ -46,14 +46,25 @@ def _cast(agent: TriageAgent, case: ATRFCase, evidence: dict[str, Any]) -> Vote:
     return v
 
 
-def vote(case: ATRFCase, agents: list[TriageAgent], evidence: dict[str, Any], quorum: int = 2) -> Triage:
+def default_quorum(voters: int) -> int:
+    """At least 2 votes and a strict majority of the voters: 2 of 3, 3 of 4, 3 of 5."""
+    return max(2, voters // 2 + 1)
+
+
+def vote(case: ATRFCase, agents: list[TriageAgent], evidence: dict[str, Any], quorum: int | None = None) -> Triage:
+    """The category `quorum` voters agree on (default: default_quorum); a tie for first never decides."""
     cast = [_cast(agent, case, evidence) for agent in agents]
     votes = [v.category.value for v in cast]
     notes = [v.note for v in cast if v.note]
-    top, n = Counter(votes).most_common(1)[0] if votes else (TriageCategory.UNKNOWN.value, 0)
+    quorum = quorum or default_quorum(len(votes))
+    ranked = Counter(votes).most_common(2)
+    top, n = ranked[0] if ranked else (TriageCategory.UNKNOWN.value, 0)
+    if len(ranked) > 1 and ranked[1][1] == n:
+        return Triage(category=TriageCategory.UNKNOWN, confidence=0.0, decided_by="vote",
+                      reason=f"votes tied {n}-{n}; needs human review", votes=votes, notes=notes)
     if n >= quorum and top != TriageCategory.UNKNOWN.value:
         return Triage(category=TriageCategory(top), confidence=n / len(votes), decided_by="vote",
                       reason=f"{n} of {len(votes)} agents agreed", votes=votes,
                       evidence=[v.evidence for v in cast if v.category.value == top and v.evidence], notes=notes)
     return Triage(category=TriageCategory.UNKNOWN, confidence=0.0, decided_by="vote",
-                  reason="no quorum; needs human review", votes=votes, notes=notes)
+                  reason=f"no quorum ({quorum} of {len(votes)} needed); needs human review", votes=votes, notes=notes)

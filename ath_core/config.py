@@ -47,6 +47,8 @@ class AgentRunnerConfig(_Model):
     pass_env: list[str] = Field(default_factory=list, alias="passEnv")
     set_env: dict[str, str] = Field(default_factory=dict, alias="setEnv")  # fixed values, e.g. AINXT_MAX_RETRIES
     voters: int = Field(3, ge=1, le=5)
+    # Votes that must agree on a category. Default: a strict majority, at least 2 (2 of 3, 3 of 4, 3 of 5).
+    quorum: int | None = Field(None, ge=1, le=5)
     models: list[str] = Field(default_factory=list)  # one per voter, cycled; else the profile's triage model
     # Model family per glob, e.g. {"claude-*": anthropic, "onprem-llama*": meta}. Voters from one family
     # make correlated mistakes; minFamilies > 1 requires that many distinct families among the voters.
@@ -67,6 +69,8 @@ class AgentRunnerConfig(_Model):
             raise ValueError(f"agent CLI must not auto-approve tool calls; remove {auto_approve} from command")
         if self.timeout_resumes and not any("{session_id}" in a for a in self.resume_args):
             raise ValueError("timeoutResumes needs resumeArgs with a {session_id} placeholder")
+        if self.quorum and self.quorum > self.voters:
+            raise ValueError(f"quorum ({self.quorum}) cannot exceed voters ({self.voters})")
         if self.min_families > self.voters:
             raise ValueError(f"minFamilies ({self.min_families}) cannot exceed voters ({self.voters})")
         if self.prompt_via == "arg" and "{prompt}" not in joined:
@@ -78,6 +82,11 @@ class AgentRunnerConfig(_Model):
 
 class HarnessConfig(_Model):
     agent_runner: AgentRunnerConfig | None = Field(None, alias="agentRunner")
+
+    @property
+    def quorum(self) -> int | None:
+        """agentRunner.quorum, or None for the default (see ath_core.triage.voting.default_quorum)."""
+        return self.agent_runner.quorum if self.agent_runner else None
     skills_dir: Path = Field(DEFAULT_SKILLS_DIR, alias="skillsDir")
     model_policy: Path | None = Field(None, alias="modelPolicy")  # default: config/model-policy.yaml of the install
     source: Path | None = Field(None, exclude=True)

@@ -1,7 +1,9 @@
+import pytest
+
 from ath_core.schemas import ATRFCase, ATRFFailure, ATRFRun, CaseStatus, TriageCategory
 from ath_core.schemas.profile import KnownFailure
 from ath_core.triage.precheck import apply_prechecks, mark_flaky
-from ath_core.triage.voting import vote
+from ath_core.triage.voting import default_quorum, vote
 
 
 def _run(commit, statuses):
@@ -56,3 +58,27 @@ def test_vote_disagreement_and_agent_errors_become_unknown():
 def test_agent_cannot_return_precheck_only_categories():
     t = vote(_case(), [_Agent(n, TriageCategory.PRE_EXISTING) for n in "abc"], {})
     assert t.category == TriageCategory.UNKNOWN
+
+
+REG, ENV, DATA, UNK = (TriageCategory.CODE_REGRESSION, TriageCategory.ENVIRONMENT, TriageCategory.TEST_DATA,
+                       TriageCategory.UNKNOWN)
+
+
+def _votes(*answers, quorum=None):
+    return vote(_case(), [_Agent(str(i), a) for i, a in enumerate(answers)], {}, quorum=quorum)
+
+
+def test_default_quorum_is_a_strict_majority_of_at_least_two():
+    assert [default_quorum(n) for n in range(1, 6)] == [2, 2, 2, 3, 3]
+    assert _votes(REG).category == UNK                      # one voter never decides alone by default
+    assert _votes(REG, quorum=1).category == REG            # unless quorum: 1 says so
+    assert _votes(ENV, ENV, ENV, REG).category == ENV       # 3 of 4
+    assert _votes(ENV, ENV, REG, DATA, UNK).category == UNK  # 2 of 5 is not a majority
+    assert _votes(ENV, ENV, REG, DATA, UNK, quorum=2).category == ENV
+
+
+@pytest.mark.parametrize("answers", [(ENV, ENV, REG, REG), (ENV, REG), (ENV, ENV, UNK, UNK)])
+def test_a_tie_for_first_is_never_a_verdict(answers):
+    for order in (answers, answers[::-1]):  # voter order must not matter
+        t = _votes(*order, quorum=1)
+        assert t.category == UNK and "tied" in t.reason

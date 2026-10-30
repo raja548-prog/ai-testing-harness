@@ -408,7 +408,8 @@ agentRunner:
   sessionArgs: [--session-id, "{session_id}"]
   resumeArgs: [-r, "{session_id}"]
   timeoutResumes: 1                 # resume a timed-out session this many times
-  voters: 3                         # triage voters; 2 must agree
+  voters: 3                         # triage voters
+  # quorum: 2                       # votes that must agree; default: a strict majority, at least 2
   models: []                        # optional, one per voter; default: the profile's triage model
   modelFamilies: {}                 # e.g. {"onprem-llama*": meta, "onprem-qwen*": qwen}
   minFamilies: 1                    # >1: voters must span this many model families
@@ -504,7 +505,9 @@ These are the categories:
 
 Triage verdicts show how many voters agreed and the verified quote they relied on, e.g. `3 of 3 agents agreed; evidence: "… ERROR settlement failed for rrn=…"`.
 
-A vote whose quote isn't found in the inputs ATH sent is discarded. The reason is recorded in the run's results.
+A vote whose quote isn't found in the failure message, stack trace, logs or diff ATH sent is discarded; quotes from the TSD, the product notes or the case's field names don't count. The reason is recorded in the run's results.
+
+A category needs `quorum` agreeing votes (default: a strict majority of the voters, at least 2). A tie for first place, or a voter's output holding two different answers, is never a verdict: the failure goes to human review as `unknown`.
 
 ### 7.3 Modes
 
@@ -609,7 +612,7 @@ A run makes 3 CLI sessions per case, one after another, so allow time for it.
 | `refused: model policy: stage 'triage' sees 'restricted' data …` | The voter's model doesn't match an allowed pattern. Use an on-prem model, or have the platform team adjust the policy. |
 | `triage voters come from 1 model family …` | `minFamilies` is above 1, but the voters all come from one family. Add models from another family. |
 | `agent CLI 'ainxt' not found on PATH` | Install the CLI, or set the full path as the first `command` entry. |
-| Every triage vote is `unknown` | Check the votes' notes in the run's results: CLI errors, timeouts, or quotes not found in the inputs. Then run `ainxt-ath eval` to see the pattern. |
+| Every triage vote is `unknown` | Check the votes' notes in the run's results: CLI errors, timeouts, quotes not found in the failure, logs or diff, or output with more than one answer. Then run `ainxt-ath eval` to see the pattern. |
 | `… triggered this run …, so they cannot approve its gates` | Separation of duties. Someone else in the owners groups must approve. |
 | `model policy … not found` | An installed copy is missing its data files. Reinstall from the wheel, or set `modelPolicy:`. |
 

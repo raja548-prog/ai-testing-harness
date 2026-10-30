@@ -63,7 +63,7 @@ def _orchestrator(product: str, profile_file: str) -> Orchestrator:
         agents = build_triage_agents(CONFIG, profile)
     except ValueError as e:  # server harness config breaks a rule, e.g. model-family diversity
         raise HTTPException(500, f"server agent config: {e}")
-    return Orchestrator(profile, STORE, agents=agents, profile_ref=profile_file)
+    return Orchestrator(profile, STORE, agents=agents, profile_ref=profile_file, quorum=CONFIG.quorum)
 
 
 @app.post("/runs", status_code=202)

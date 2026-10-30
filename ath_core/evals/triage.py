@@ -91,7 +91,7 @@ class Outcome:
         return self.truth == self.predicted
 
 
-def run_eval(dataset: list[tuple[EvalCase, Truth]], agents: list[TriageAgent], quorum: int = 2,
+def run_eval(dataset: list[tuple[EvalCase, Truth]], agents: list[TriageAgent], quorum: int | None = None,
              progress: Callable[[int, int, "Outcome"], None] | None = None) -> list[Outcome]:
     outcomes = []
     for i, (case, truth) in enumerate(dataset, 1):

@@ -132,3 +132,22 @@ def test_error_outside_a_stage_still_fails_the_run_and_frees_the_env(orch, monke
         orch.start(_ctx())
     assert orch.store.load_manifest("r1").status == RunStatus.FAILED
     assert FakeLock.held == {}
+
+
+
+class _Answer:
+    def __init__(self, name, category):
+        self.name, self.category = name, category
+
+    def classify(self, case, evidence):
+        return self.category
+
+
+@pytest.mark.parametrize("quorum, expected", [(None, TriageCategory.TEST_DATA), (3, TriageCategory.UNKNOWN)])
+def test_configured_quorum_is_used_for_triage(tmp_path, quorum, expected):
+    agents = [_Answer("a", TriageCategory.TEST_DATA), _Answer("b", TriageCategory.TEST_DATA),
+              _Answer("c", TriageCategory.ENVIRONMENT)]
+    o = Orchestrator(load_profile(LOCAL_PROFILE), StateStore(":memory:"), report_dir=tmp_path,
+                     agents=agents, quorum=quorum)
+    o.start(_ctx())
+    assert _cats(o.store, "r1")["SNX-001"] == expected

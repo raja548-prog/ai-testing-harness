@@ -15,6 +15,7 @@ from pathlib import Path
 from ath_core.adapters import AdapterError, registry
 from ath_core.adapters import loader  # noqa: F401
 from ath_core.agents.cli import build_triage_agents, diversity_problem, load_skill, model_family, voter_models
+from ath_core.triage.voting import default_quorum
 from ath_core.config import load_config
 from ath_core.context import read_rh_package
 from ath_core.policy import load_policy
@@ -95,8 +96,8 @@ def _doctor_agent_runner(a: argparse.Namespace) -> int:
             problems.append(problem)
     except ValueError as e:
         problems.append(str(e))
-    print(f"  [{'ok' if not problems else 'CONFIG'}] agent runner: {rc.command[0]} x{rc.voters} voters "
-          f"(from {cfg.source})")
+    print(f"  [{'ok' if not problems else 'CONFIG'}] agent runner: {rc.command[0]} x{rc.voters} voters, "
+          f"{rc.quorum or default_quorum(rc.voters)} must agree (from {cfg.source})")
     families = [model_family(m, rc.model_families) or "unclassified" for m in models]
     labels = [f"{m or '(no model)'} ({f})" for m, f in zip(models, families)]
     print(f"      voters: {', '.join(labels)}")
@@ -128,13 +129,14 @@ def _doctor_model_policy(a: argparse.Namespace, profile) -> int:
 
 def _orch(a: argparse.Namespace) -> Orchestrator:
     profile = load_profile(a.profile)
-    agents = build_triage_agents(load_config(a.config), profile)
+    cfg = load_config(a.config)
+    agents = build_triage_agents(cfg, profile)
     store = StateStore(a.db)
     quarantined = set()
     if getattr(a, "quarantine", None):
         quarantined = {l.strip() for l in Path(a.quarantine).read_text().splitlines() if l.strip()}
     return Orchestrator(profile, store, package_version=a.package_version, quarantined=quarantined,
-                        report_dir=a.report_dir, agents=agents, profile_ref=str(a.profile))
+                        report_dir=a.report_dir, agents=agents, profile_ref=str(a.profile), quorum=cfg.quorum)
 
 
 def _context(a: argparse.Namespace) -> dict[str, str]:
@@ -218,7 +220,8 @@ def cmd_eval(a: argparse.Namespace) -> int:
 
     try:
         profile = load_profile(a.profile)
-        agents = build_triage_agents(load_config(a.config), profile)
+        cfg = load_config(a.config)
+        agents = build_triage_agents(cfg, profile)
         dataset = ev.load_dataset(a.dataset)
     except (ValueError, OSError) as e:
         print(f"refused: {e}")
@@ -232,7 +235,7 @@ def cmd_eval(a: argparse.Namespace) -> int:
         print(f"  [{i:>2}/{n}] {mark} {o.id}: {o.predicted:<15} truth {o.truth:<15} votes {', '.join(o.votes)}",
               flush=True)
 
-    outcomes = ev.run_eval(dataset, agents, progress=progress)
+    outcomes = ev.run_eval(dataset, agents, quorum=cfg.quorum, progress=progress)
     s = ev.score(outcomes)
     report = ev.render_md(s, outcomes, title=f"Triage eval: {Path(a.dataset).name}")
     out = Path(a.out or f".ath/evals/triage-{uuid.uuid4().hex[:8]}")

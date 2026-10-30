@@ -36,6 +36,7 @@ from ath_core.triage.voting import Vote
 
 BASE_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT")
 _INCLUDE = re.compile(r"^Include:\s*`([^`]+)`\s*$", re.MULTILINE)
+_DATA_TAG = re.compile(r"(?i)<(\s*/?\s*data)\b")
 
 
 class AgentError(RuntimeError):
@@ -66,8 +67,9 @@ def load_skill(path: str | Path) -> Skill:
 
 
 def _escape(value: str) -> str:
-    # Data must not be able to close its own <data> block and pose as instructions.
-    return value.replace("</data", "<\\/data")
+    # Data must not be able to close its <data> block or open another one (any case or spacing)
+    # and pose as instructions: `</DATA>` becomes `<\/DATA>`, `<data name=` becomes `<\data name=`.
+    return _DATA_TAG.sub(r"<\\\1", value)
 
 
 def build_prompt(skill: Skill, data: dict[str, str]) -> str:
@@ -99,7 +101,10 @@ def _envelope(text: str) -> dict[str, Any] | None:
 
 
 def extract_json(text: str, schema: dict[str, str]) -> dict[str, Any]:
-    """The last JSON object in the CLI output that satisfies the schema (CLIs print chatter too).
+    """The one JSON object in the CLI output that satisfies the schema (CLIs print chatter too).
+
+    Two different matching objects are an error, not a choice: one of them may be JSON the model
+    echoed from its inputs, e.g. planted in a log line.
 
     Plain output is scanned as is. A JSON envelope such as {"text": "...", "stopReason": ...}
     is unwrapped first; {"type": "error", "message": ...} becomes an AgentError.
@@ -111,7 +116,7 @@ def extract_json(text: str, schema: dict[str, str]) -> dict[str, Any]:
         if isinstance(env.get("text"), str):
             text = env["text"]
     decoder = json.JSONDecoder()
-    found = None
+    found: list[dict[str, Any]] = []
     for i, ch in enumerate(text):
         if ch != "{":
             continue
@@ -119,11 +124,14 @@ def extract_json(text: str, schema: dict[str, str]) -> dict[str, Any]:
             obj, _ = decoder.raw_decode(text, i)
         except ValueError:
             continue
-        if validate_output(obj, schema):
-            found = obj
-    if found is None:
+        if validate_output(obj, schema) and obj not in found:
+            found.append(obj)
+    if not found:
         raise AgentError("agent output contains no JSON object matching the stage schema")
-    return found
+    if len(found) > 1:
+        raise AgentError(f"agent output contains {len(found)} different JSON answers matching the stage schema; "
+                         "it may have echoed JSON from its inputs")
+    return found[0]
 
 
 CONTINUE_PROMPT = ("Continue from where you stopped and finish now. Respond with exactly one JSON object "
@@ -299,7 +307,7 @@ def quote_found(quote: str, sources: list[str]) -> bool:
 class CliTriageAgent:
     """One T7 voter backed by a CLI session running skills/t07-triage.
 
-    A vote counts only if its `quote` is found in the data ATH sent (not in the skill text);
+    A vote counts only if its `quote` is found in the failure message, trace, logs or diff ATH sent;
     otherwise it becomes `unknown` with a note. This catches invented evidence without a model.
     """
 
@@ -327,14 +335,16 @@ class CliTriageAgent:
         quote = self.masker.mask(str(out.get("quote") or ""))
         if category == TriageCategory.UNKNOWN:
             return Vote(category, note=f"{self.name}: unknown ({self.last_evidence[:150] or 'no reason given'})")
-        # What the model could have quoted: every real data block, plus the case's text fields unescaped
-        # (the case block is JSON, so a quoted failure message would not match it character for character).
-        sources = [v for v in sent.values() if not v.startswith(_PLACEHOLDER)]
-        sources += [self.masker.mask(t) for t in (case.name, case.failure.message if case.failure else "",
-                                                  case.failure.trace if case.failure else "") if t]
+        # Quotable evidence: the failure message and trace (as plain text, not as the case's JSON) and the
+        # logs and diff. Not the case JSON, test name, TSD or product notes: field names and boilerplate
+        # there would let any vote pass the check.
+        failure = case.failure
+        sources = [self.masker.mask(t) for t in (failure.message, failure.trace) if t] if failure else []
+        sources += [sent[k] for k in ("logs", "diff") if sent[k] and not sent[k].startswith(_PLACEHOLDER)]
         if not quote_found(quote, sources):
             why = (f"gave no quote of at least {MIN_QUOTE_CHARS} characters"
-                   if len(_clean_quote(quote)) < MIN_QUOTE_CHARS else "quoted text that is not in the inputs")
+                   if len(_clean_quote(quote)) < MIN_QUOTE_CHARS
+                   else "quoted text that is not in the failure message, trace, logs or diff")
             return Vote(TriageCategory.UNKNOWN, note=f"{self.name}: voted {category.value} but {why}; vote discarded")
         return Vote(category, evidence=_clean_quote(quote))
 

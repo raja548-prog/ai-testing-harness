@@ -52,12 +52,14 @@ class GateRequired(Exception):
 class Orchestrator:
     def __init__(self, profile: TestProfile, store: StateStore, package_version: str = "dev",
                  agents: list[TriageAgent] | None = None, quarantined: set[str] | None = None,
-                 report_dir: str | Path | None = None, profile_ref: str | None = None):
+                 report_dir: str | Path | None = None, profile_ref: str | None = None,
+                 quorum: int | None = None):
         self.profile = profile
         self.profile_ref = profile_ref
         self.store = store
         self.package_version = package_version
         self.agents = agents or []
+        self.quorum = quorum  # None: default_quorum(len(agents))
         self.quarantined = quarantined or set()
         self.report_dir = Path(report_dir) if report_dir else None
         self.masker = Masker(categories=profile.logs.masking, correlation_keys=profile.correlation_keys())
@@ -296,7 +298,7 @@ class Orchestrator:
                 evidence = {"logs": self._logs_for(ctx, case).lines, "diff_ref": ctx.commit,
                             "diff": diff_excerpt(diff, case) if diff else "",
                             "tsd": tsd_excerpt(tsd, case) if tsd else ""}
-                case.triage = vote(case, self.agents, evidence) if self.agents else None
+                case.triage = vote(case, self.agents, evidence, self.quorum) if self.agents else None
                 for agent in self.agents:  # audit: one event per model call (hashes, never content)
                     if getattr(agent, "last_call", None):
                         self.store.event(ctx.run_id, "T7", "agent.call", case=case.id, agent=agent.name,

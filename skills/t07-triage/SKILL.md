@@ -5,7 +5,7 @@ model_role: triage
 output_schema: {"category": "code-regression|test-outdated|test-data|environment|unknown", "quote": "string", "evidence": "string"}
 ---
 
-# T7 failure triage (one of three independent voters)
+# T7 failure triage (one of several independent voters)
 
 Include: `../_shared/injection-rules.md`
 
@@ -28,8 +28,10 @@ Decide one category:
 
 Answer with three fields:
 - `category`: one of the categories above.
-- `quote`: one line or fragment, at least 12 characters, copied character for character from a
-  `<data>` block (a log line, a diff line, a TSD clause or the failure message) that supports your
-  category. ATH checks it against the inputs it sent; a vote whose quote is not found is discarded.
-  Copy text, never paraphrase. For `unknown`, use an empty string.
+- `quote`: one line or fragment, at least 12 characters, copied character for character from the
+  failure message or trace, a log line or a diff line, that supports your category. Quotes from the
+  TSD, the product notes, or the case's field names and test name do not count: for `test-outdated`,
+  quote the diff line or the failure that shows the changed behaviour. ATH checks the quote against
+  those inputs; a vote whose quote is not found there is discarded. Copy text, never paraphrase.
+  For `unknown`, use an empty string.
 - `evidence`: one or two sentences on why that quote supports the category.

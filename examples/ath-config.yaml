@@ -37,7 +37,9 @@ agentRunner:
   sessionArgs: [--session-id, "{session_id}"]
   resumeArgs: [-r, "{session_id}"]  # resumed with a short "finish now and answer in JSON" prompt
   timeoutResumes: 1
-  voters: 3                         # independent T7 triage sessions; 2 of 3 must agree
+  voters: 3                         # independent T7 triage sessions
+  # quorum: 2                       # votes that must agree; default: a strict majority, at least 2
+                                    # (2 of 3, 3 of 4, 3 of 5). A tie for first is never a verdict.
   # Voters from one model family make the same mistakes. List models from different families
   # (names from `ainxt models`), map them to families, then raise minFamilies to 2.
   # models: [onprem-llama-70b, onprem-qwen-72b, onprem-llama-70b]
