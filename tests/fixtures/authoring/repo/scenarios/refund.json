@@ -1,0 +1,5 @@
+{
+  "scenario": "refund-full",
+  "amount": "1000.00",
+  "expectedFee": "-12.50"
+}

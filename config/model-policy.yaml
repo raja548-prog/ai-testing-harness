@@ -12,7 +12,7 @@ dataClasses:
 
 stages:                # what each LLM stage sends to its model; a stage not listed is `restricted`
   impact: internal     # T1: diff + TSD + product skill
-  author: internal     # T3: TSD clauses + test conventions
+  author: restricted   # T3: TSD, test files and failure messages (masked test data, CSV transaction rows)
   triage: restricted   # T7: masked case, logs, diff
   remediate: restricted  # T10: failures, logs, code
   validate: restricted   # T11: rerun results, fix diff

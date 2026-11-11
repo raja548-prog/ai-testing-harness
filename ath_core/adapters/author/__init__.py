@@ -1,1 +1,1 @@
-from . import git_mr  # noqa: F401
+from . import git_mr, local_fs  # noqa: F401

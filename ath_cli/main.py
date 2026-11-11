@@ -6,8 +6,10 @@ platform, the same commands call the ATH API with the user's SSO token instead.
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import shutil
+import subprocess
 import sys
 import uuid
 from pathlib import Path
@@ -17,13 +19,18 @@ import yaml
 from ath_core.adapters import AdapterError, registry
 from ath_core.adapters import loader  # noqa: F401
 from ath_core.agents.cli import (
-    build_triage_agents, diversity_problem, load_skill, model_family, model_problem, voter_models,
+    AgentError, author_model, build_author_agent, build_triage_agents, diversity_problem, load_skill, model_family,
+    model_problem, voter_models,
 )
+from ath_core.authoring.engine import AuthorInputs, AuthoringEngine, load_proposal, save_proposal
+from ath_core.authoring.formats import glob_match
+from ath_core.authoring.testdata import load_catalogue
 from ath_core.triage.voting import default_quorum
 from ath_core.config import load_config
-from ath_core.context import read_rh_package
+from ath_core.context import load_product_skill, read_rh_package
 from ath_core.policy import load_policy
-from ath_core.schemas import RunContext, RunMode, Stage, load_profile
+from ath_core.schemas import ATRFRun, RunContext, RunMode, Stage, TriageCategory, load_profile
+from ath_core.schemas.authoring import Proposal
 from ath_server.orchestrator import Orchestrator, StateStore
 
 KIND_FOR = {"build": "pipeline", "deploy": "pipeline"}
@@ -76,6 +83,7 @@ def cmd_doctor(a: argparse.Namespace) -> int:
               if field == "policy.quarantineList" else f"  [note] {field} is set but runs do not check it yet")
     bad += _doctor_agent_runner(a)
     bad += _doctor_model_policy(a, p)
+    bad += _doctor_authoring(a, p)
     # TODO (platform): check the user's Git/Jira profile tokens and env reachability.
     print("doctor: all adapters available and configured" if not bad else f"doctor: {bad} adapter(s) missing or misconfigured")
     return 0 if not bad else 2
@@ -141,6 +149,76 @@ def _doctor_model_policy(a: argparse.Namespace, profile) -> int:
     return 1 if problems else 0
 
 
+def _doctor_authoring(a: argparse.Namespace, p) -> int:
+    """Product skill and T3 test authoring. Returns the number of problems; warnings do not count."""
+    bad = 0
+    if p.product_skill:
+        try:
+            skill = load_product_skill(p)
+            problem = None if skill.meta else "has no front matter (name, product, version, approved_by)"
+        except OSError as e:
+            problem = f"not readable: {e}"
+        bad += bool(problem)
+        print(f"  [{'ok' if not problem else 'CONFIG'}] product skill: {p.resolve_path(p.product_skill)}")
+        if problem:
+            print(f"      - {problem}")
+    ta = p.test_authoring
+    if ta is None or not ta.enabled:
+        print(f"  [--] test authoring (T3): {'not configured' if ta is None else 'off (enabled: false)'}")
+        return bad
+    problems, notes = [], []
+    try:
+        cfg = load_config(a.config)
+        skill = load_skill(cfg.skills_dir / "t03-author" / "SKILL.md")
+        if not skill.output_schema:
+            problems.append("author skill has no output_schema")
+        if problem := load_policy(cfg.model_policy).problem([author_model(p)], "author", p.product):
+            problems.append(problem)
+    except (OSError, ValueError) as e:
+        problems.append(f"author skill or model policy: {e}")
+    if ta.mode != "local-fs":
+        notes.append(f"mode {ta.mode} is not implemented yet; runs skip T3 (use mode: local-fs)")
+    if not ta.sources:
+        notes.append("sources is empty: T3 cannot change any file")
+    if ta.conventions and not p.resolve_path(ta.conventions).is_file():
+        problems.append(f"conventions file {p.resolve_path(ta.conventions)} not found")
+    tests = Path(a.tests) if getattr(a, "tests", None) else None
+    if tests and tests.is_dir():
+        files = _all_files(tests)
+        for src in ta.sources:
+            notes += [f"sources glob {g!r} matches no file in {tests}" for g in src.paths
+                      if not any(glob_match(f, g) for f in files)]
+        notes += [f"templates glob {g!r} matches no file in {tests}" for g in ta.templates
+                  if not any(glob_match(f, g) for f in files)]
+        if ta.test_data:
+            try:
+                n = len(load_catalogue(tests / ta.test_data).entries)
+                notes.append(f"testData catalogue: {n} entries")
+            except (OSError, ValueError, yaml.YAMLError) as e:
+                problems.append(f"testData catalogue: {e}")
+    elif tests:
+        problems.append(f"--tests {tests} is not a folder")
+    else:
+        notes.append("no --tests checkout given: sources/templates globs and the testData catalogue were not checked")
+    code = Path(a.code) if getattr(a, "code", None) else None
+    if code and code.is_dir() and ta.code_context:
+        files = _all_files(code)
+        notes += [f"codeContext glob {g!r} matches no file in {code}" for g in ta.code_context
+                  if not any(glob_match(f, g) for f in files)]
+    print(f"  [{'ok' if not problems else 'CONFIG'}] test authoring (T3): mode {ta.mode}, "
+          f"{sum(len(s.paths) for s in ta.sources)} source glob(s), model {author_model(p) or '(none)'}")
+    for problem in problems:
+        print(f"      - {problem}")
+    for note in notes:
+        print(f"      note: {note}")
+    return bad + bool(problems)
+
+
+def _all_files(root: Path) -> list[str]:
+    return sorted(f.relative_to(root).as_posix() for f in root.rglob("*")
+                  if f.is_file() and not any(part.startswith(".") for part in f.relative_to(root).parts))
+
+
 def _orch(a: argparse.Namespace) -> Orchestrator:
     profile = load_profile(a.profile)
     cfg = load_config(a.config)
@@ -150,7 +228,8 @@ def _orch(a: argparse.Namespace) -> Orchestrator:
     if getattr(a, "quarantine", None):
         quarantined = {l.strip() for l in Path(a.quarantine).read_text().splitlines() if l.strip()}
     return Orchestrator(profile, store, package_version=a.package_version, quarantined=quarantined,
-                        report_dir=a.report_dir, agents=agents, profile_ref=str(a.profile), quorum=cfg.quorum)
+                        report_dir=a.report_dir, agents=agents, profile_ref=str(a.profile), quorum=cfg.quorum,
+                        author_factory=lambda: build_author_agent(cfg, profile))
 
 
 def _context(a: argparse.Namespace) -> dict[str, str]:
@@ -164,6 +243,16 @@ def _context(a: argparse.Namespace) -> dict[str, str]:
     if tsd:
         ctx["tsd"] = "\n\n".join(tsd)
     return ctx
+
+
+def _folder(path: str | None, flag: str) -> str | None:
+    """An absolute folder path for the run context; ValueError if it is not a folder."""
+    if not path:
+        return None
+    p = Path(path).expanduser()
+    if not p.is_dir():
+        raise ValueError(f"{flag} {path} is not a folder")
+    return str(p.resolve())
 
 
 def _print_result(m) -> int:
@@ -190,6 +279,7 @@ def cmd_run(a: argparse.Namespace) -> int:
             run_id=a.run_id or f"ath-{uuid.uuid4().hex[:10]}", product=orch.profile.product,
             mode=RunMode(a.mode), mr=a.mr, jira=a.jira, commit=a.commit, merge_base=a.merge_base,
             env=a.env, changed_paths=a.changed or [], triggered_by=a.user, trigger_source="cli",
+            author=a.author, tests_dir=_folder(a.tests, "--tests"), code_dir=_folder(a.code, "--code"),
         )
     except REFUSALS as e:  # missing or invalid file, the model-family rule, a bad --run-id
         print(f"refused: {e}")
@@ -220,8 +310,10 @@ def cmd_gate(a: argparse.Namespace) -> int:
         orch = _orch(a)
         stage = Stage(a.gate)
         groups = [g.strip() for g in (a.groups or "").split(",") if g.strip()]
-        decide = orch.approve if a.decision == "approved" else orch.reject
-        m = decide(a.run_id, stage, a.user, groups, a.comment or "")
+        if a.decision == "approved":
+            m = orch.approve(a.run_id, stage, a.user, groups, a.comment or "", ref=a.ref)
+        else:
+            m = orch.reject(a.run_id, stage, a.user, groups, a.comment or "")
     except (*REFUSALS, PermissionError) as e:
         print(f"refused: {_why(e)}")
         return 1
@@ -273,6 +365,176 @@ def cmd_eval(a: argparse.Namespace) -> int:
     return 3 if failures else 0
 
 
+# `ainxt-ath author` exit codes (2 and 3 are taken by doctor and eval).
+AUTHOR_OK, AUTHOR_REFUSED, AUTHOR_ONLY_QUESTIONS, AUTHOR_ALL_DROPPED = 0, 1, 4, 5
+
+
+def _git_dirty(root: Path, paths: list[str]) -> list[str] | None:
+    """`git status --porcelain` lines for these paths; None when root is not in a Git work tree."""
+    def git(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(root), "-c", "core.quotepath=off", *args],
+                              capture_output=True, text=True)
+    try:
+        inside = git("rev-parse", "--is-inside-work-tree")
+    except FileNotFoundError:  # no git installed
+        return None
+    if inside.returncode != 0 or inside.stdout.strip() != "true":
+        return None
+    if not paths:
+        return []
+    return [line for line in git("status", "--porcelain", "--", *paths).stdout.splitlines() if line.strip()]
+
+
+def _from_run(store: StateStore, run_id: str, product: str) -> tuple[str, str, list[dict[str, str]]]:
+    """(TSD, diff, test-outdated cases) stored with a run. Raises KeyError for an unknown run."""
+    m = store.load_manifest(run_id)
+    if m is None:
+        raise KeyError(f"unknown run {run_id} in {store.db_path}")
+    if m.context.product != product:
+        raise ValueError(f"run {run_id} is for {m.context.product!r}, not {product!r}")
+    cp = store.get_checkpoint(run_id, Stage.T2_SELECT)
+    outdated = []
+    for suite in (cp.output.get("suites", []) if cp else []):
+        body = store.get_artifact(run_id, f"atrf/{suite}.json")
+        if not body:
+            continue
+        for c in ATRFRun.model_validate_json(body).failing():
+            if c.triage and c.triage.category == TriageCategory.TEST_OUTDATED:
+                outdated.append({"id": c.id, "suite": c.suite, "name": c.name,
+                                 "message": c.failure.message if c.failure else ""})
+    return store.get_artifact(run_id, "context/tsd") or "", store.get_artifact(run_id, "context/diff") or "", outdated
+
+
+def _print_proposal(p: Proposal, folder: Path) -> None:
+    print(f"proposal {p.id}: {len(p.changes)} change(s), {len(p.dropped)} dropped, "
+          f"{len(p.spec_questions)} spec question(s)")
+    print(f"  hash {p.hash}")
+    for c in p.changes:
+        print(f"  {c.action:<6} {c.path}  [{', '.join(c.clauses)}]")
+        for flag in c.flags:
+            print(f"         review: {flag}")
+    for d in p.dropped:
+        print(f"  DROPPED {d.path}: {d.reason}")
+    for q in p.spec_questions:
+        print(f"  QUESTION {('[' + q.clause + '] ') if q.clause else ''}{q.question}")
+    if p.summary:
+        print(f"  summary: {' '.join(p.summary.split())}")
+    print(f"  review: {folder / 'changes.patch'} and {folder / 'checklist.md'}")
+
+
+def _author_apply(profile, p: Proposal, tests: Path, force: bool, user: str, store: StateStore) -> int:
+    paths = [c.path for c in p.changes]
+    dirty = _git_dirty(tests, paths)
+    if not force:
+        if dirty is None:
+            print(f"refused: {tests} is not a Git repository, so uncommitted changes cannot be checked; "
+                  f"pass --force to write anyway")
+            return AUTHOR_REFUSED
+        if dirty:
+            print("refused: target files have uncommitted changes (commit or stash them, or pass --force):")
+            for line in dirty:
+                print(f"  {line}")
+            return AUTHOR_REFUSED
+    try:
+        result = registry.create("author", "local-fs", profile=profile).apply(p, tests, user)
+    except AdapterError as e:
+        print(f"refused: {e}")
+        return AUTHOR_REFUSED
+    store.event(p.id, "T3", "author.applied", proposal=p.hash, applied=result.applied,
+                already_applied=result.already_applied, by=user)
+    for path in result.applied:
+        print(f"  wrote {path}")
+    for path in result.already_applied:
+        print(f"  already applied {path}")
+    print(f"applied to {tests}; review with `git diff`, then commit or open an MR as usual")
+    return AUTHOR_OK
+
+
+def cmd_author(a: argparse.Namespace) -> int:
+    """Create or update tests from a TSD in a local checkout, without a run. `author apply <id>` applies a
+    stored proposal (e.g. a --dry-run one) without a model call."""
+    out_root = Path(a.out or ".ath/authoring")
+    store = StateStore(a.db)
+    if a.action is None and a.proposal_id:
+        print(f"refused: unexpected argument {a.proposal_id!r}; did you mean `author apply {a.proposal_id}`?")
+        return AUTHOR_REFUSED
+    try:
+        profile = load_profile(a.profile)
+        ta = profile.test_authoring
+        if ta is None:
+            raise ValueError(f"profile {a.profile} has no testAuthoring section")
+        if not ta.sources:
+            raise ValueError("testAuthoring.sources is empty: list the test files T3 may change")
+        tests = Path(a.tests).expanduser()
+        if not tests.is_dir():
+            raise ValueError(f"--tests {a.tests} is not a folder")
+    except REFUSALS as e:
+        print(f"refused: {_why(e)}")
+        return AUTHOR_REFUSED
+    if a.action == "apply":
+        if not a.proposal_id:
+            print("refused: give the proposal id: ainxt-ath author apply <id>")
+            return AUTHOR_REFUSED
+        folder = out_root / a.proposal_id
+        try:
+            p = load_proposal(folder)
+        except (OSError, ValueError) as e:
+            print(f"refused: {_why(e)}")
+            return AUTHOR_REFUSED
+        if p.product != profile.product:
+            print(f"refused: proposal {p.id} is for {p.product!r}, not {profile.product!r}")
+            return AUTHOR_REFUSED
+        print(f"applying proposal {p.id} (hash {p.hash}), no model call")
+        return _author_apply(profile, p, tests, a.force, a.user, store)
+
+    agent = None
+    pid = f"author-{uuid.uuid4().hex[:10]}"
+    try:
+        if not a.dry_run and not a.force and _git_dirty(tests, []) is None:
+            raise ValueError(f"{tests} is not a Git repository, so uncommitted changes cannot be checked; "
+                             f"pass --force to write anyway, or --dry-run to only propose")
+        tsd, diff, outdated = "", "", []
+        if a.from_run:
+            tsd, diff, outdated = _from_run(store, a.from_run, profile.product)
+        if a.tsd or a.rh_package:
+            parts = [Path(a.tsd).read_text(encoding="utf-8")] if a.tsd else []
+            if a.rh_package:
+                parts.append(read_rh_package(a.rh_package))
+            tsd = "\n\n".join(parts)
+        if a.diff:
+            diff = Path(a.diff).read_text(encoding="utf-8")
+        if not tsd.strip():
+            raise ValueError("no TSD: give --tsd, --rh-package, or --from-run with a run that has one")
+        agent = build_author_agent(load_config(a.config), profile)
+        inputs = AuthorInputs(tsd=tsd, tests_dir=tests, sections=a.section or [],
+                              code_dir=Path(a.code).expanduser() if a.code else None, diff=diff or None,
+                              outdated=outdated or None)
+        drafted = AuthoringEngine(profile, agent).propose(inputs, source="standalone", proposal_id=pid)
+    except (*REFUSALS, AgentError) as e:
+        print(f"refused: {_why(e)}")
+        return AUTHOR_REFUSED
+    finally:
+        if agent is not None and agent.last_call:
+            store.event(pid, "T3", "agent.call", agent="cli-author", **agent.last_call)
+    folder = out_root / pid
+    h = save_proposal(folder, drafted)
+    p = drafted.proposal
+    store.event(pid, "T3", "author.proposed", proposal=h, changes=len(p.changes), dropped=len(p.dropped),
+                spec_questions=len(p.spec_questions), dry_run=a.dry_run)
+    _print_proposal(p, folder)
+    if not p.changes:
+        if p.proposed_count == 0:
+            print("no changes proposed" + (": answer the spec questions, then run again" if p.spec_questions else ""))
+            return AUTHOR_ONLY_QUESTIONS
+        print("every proposed change was dropped by a guard; nothing to apply")
+        return AUTHOR_ALL_DROPPED
+    if a.dry_run:
+        print(f"dry run: nothing written; apply after review with: ainxt-ath author apply {pid} "
+              f"--profile {a.profile} --tests {a.tests}")
+        return AUTHOR_OK
+    return _author_apply(profile, p, tests, a.force, a.user, store)
+
+
 def cmd_events(a: argparse.Namespace) -> int:
     for stage, kind, detail in StateStore(a.db).events(a.run_id):
         print(f"{stage:<4} {kind:<20} {detail}")
@@ -290,6 +552,8 @@ def build_parser() -> argparse.ArgumentParser:
     d = sub.add_parser("doctor", help="validate profile and check adapters")
     d.add_argument("profile")
     d.add_argument("--config", help="harness config (default: $ATH_CONFIG, .ath/config.yaml, ~/.config/ainxt/ath.yaml)")
+    d.add_argument("--tests", help="test checkout: check testAuthoring globs and the testData catalogue against it")
+    d.add_argument("--code", help="code checkout: check testAuthoring.codeContext globs against it")
     d.set_defaults(fn=cmd_doctor)
 
     def common(p: argparse.ArgumentParser) -> None:
@@ -316,6 +580,13 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--tsd", help="TSD markdown for triage context")
     r.add_argument("--rh-package", help="Requirement-Harness SDLC package (manifest.json or its folder): "
                                         "its approved TSD, hash-checked, is used as context")
+    r.add_argument("--tests", help="local test checkout T3 writes approved test changes into")
+    r.add_argument("--code", help="local code checkout; T3 sends its source signatures to the author model")
+    sw = r.add_mutually_exclusive_group()
+    sw.add_argument("--author", dest="author", action="store_const", const=True, default=None,
+                    help="run T3 test authoring even if the profile has testAuthoring.enabled: false")
+    sw.add_argument("--no-author", dest="author", action="store_const", const=False,
+                    help="skip T3 test authoring in this run")
     r.set_defaults(fn=cmd_run)
 
     for name, decision, help_ in (("approve", "approved", "approve a gate and continue the run"),
@@ -327,7 +598,31 @@ def build_parser() -> argparse.ArgumentParser:
         g.add_argument("--user", required=True, help="who decides (SSO user id in the platform)")
         g.add_argument("--groups", help="comma-separated groups of that user (SSO groups in the platform)")
         g.add_argument("--comment", help="reason, recorded with the decision")
-        g.set_defaults(fn=cmd_gate, decision=decision)
+        if decision == "approved":
+            g.add_argument("--ref", help="T3: the proposal hash you reviewed; refused if the stored proposal differs")
+        g.set_defaults(fn=cmd_gate, decision=decision, ref=None)
+
+    au = sub.add_parser("author", help="create or update tests from a TSD in a local checkout "
+                                       "(exit 4: only spec questions, 5: every change dropped)")
+    au.add_argument("action", nargs="?", choices=["apply"], help="apply: apply a stored proposal, no model call")
+    au.add_argument("proposal_id", nargs="?", help="with apply: the proposal id (author-...)")
+    au.add_argument("--profile", required=True)
+    au.add_argument("--tests", required=True, help="the local test checkout")
+    au.add_argument("--tsd", help="TSD markdown")
+    au.add_argument("--rh-package", help="Requirement-Harness package: its approved TSD, hash-checked")
+    au.add_argument("--from-run", help="a run id: update the tests its triage marked test-outdated, "
+                                       "using its TSD and diff unless --tsd/--rh-package/--diff are given")
+    au.add_argument("--section", action="append", help="only this TSD section (title or ⓘ id); repeatable")
+    au.add_argument("--code", help="code checkout: send source signatures so new tests call real methods")
+    au.add_argument("--diff", help="unified diff of the change under test")
+    au.add_argument("--dry-run", action="store_true", help="store the proposal for review; write nothing")
+    au.add_argument("--force", action="store_true",
+                    help="write even if target files have uncommitted changes or the checkout is not a Git repo")
+    au.add_argument("--out", help="folder for proposals (default .ath/authoring); each goes in <out>/<id>/")
+    au.add_argument("--db", default=".ath/state.db")
+    au.add_argument("--user", default=getpass.getuser(), help="recorded as who applied the changes")
+    au.add_argument("--config", help="harness config (default: $ATH_CONFIG, .ath/config.yaml, ~/.config/ainxt/ath.yaml)")
+    au.set_defaults(fn=cmd_author)
 
     rs = sub.add_parser("resume", help="resume a run from its last checkpoint")
     common(rs)

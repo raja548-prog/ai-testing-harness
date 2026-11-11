@@ -19,7 +19,10 @@ Behaviour is chosen by $FAKE_AGENT_MODE, which the test passes through `passEnv`
   hang     hangs unless resumed with -r; the resumed call answers (and reports its session id)
   silent   prints nothing for 3 s, then answers
   drip     prints a line every 0.3 s for 1.5 s, then answers
+  author   T3: chatter, then the JSON answer read from the file $FAKE_AUTHOR_OUTPUT
+  author-invalid  T3: the schema's keys, but `changes` is not a list
 The `quote` is the first log line, else the failure message, copied from the prompt.
+With $FAKE_AGENT_RECORD set to a folder, every call writes its prompt there as call-<n>.txt.
 """
 import argparse
 import json
@@ -40,6 +43,23 @@ a, _unknown = ap.parse_known_args()
 prompt = a.p if a.p is not None else open(a.prompt_file).read() if a.prompt_file else sys.stdin.read()
 mode = os.environ.get("FAKE_AGENT_MODE", "answer")
 as_json = a.output_format == "json"
+
+if os.environ.get("FAKE_AGENT_RECORD"):
+    record = os.environ["FAKE_AGENT_RECORD"]
+    os.makedirs(record, exist_ok=True)
+    n = len([f for f in os.listdir(record) if f.startswith("call-")]) + 1
+    with open(os.path.join(record, f"call-{n}.txt"), "w", encoding="utf-8") as f:
+        f.write(prompt)
+
+if mode in ("author", "author-invalid"):
+    if mode == "author":
+        with open(os.environ["FAKE_AUTHOR_OUTPUT"], encoding="utf-8") as f:
+            answer = f.read()
+    else:
+        answer = json.dumps({"changes": "none", "spec_questions": [], "summary": ""})
+    text = "Reading the TSD and the tests...\n```json\n" + answer + "\n```"
+    print(json.dumps({"text": text, "stopReason": "end_turn"}) if as_json else text)
+    sys.exit(0)
 
 if mode == "spawn":
     import subprocess

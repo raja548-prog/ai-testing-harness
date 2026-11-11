@@ -414,3 +414,40 @@ def build_triage_agents(cfg: HarnessConfig, profile: TestProfile) -> list[CliTri
     runner = CliAgentRunner(rc)
     masker = Masker(categories=profile.logs.masking, correlation_keys=profile.correlation_keys())
     return [CliTriageAgent(f"cli-triage-{i + 1}", runner, skill, m, masker) for i, m in enumerate(models)]
+
+
+class CliAuthorAgent:
+    """The T3 author: one CLI session running skills/t03-author. A single author, not voters: a human
+    reviews what it proposes. The engine masks every block before it gets here."""
+
+    def __init__(self, runner: CliAgentRunner, skill: Skill, model: str):
+        self.runner, self.skill, self.model = runner, skill, model
+        self.last_call: dict[str, Any] = {}
+
+    def run(self, blocks: dict[str, str]) -> dict[str, Any]:
+        try:
+            return self.runner.run(self.skill, blocks, self.model)
+        finally:  # keep the audit record of failed calls too
+            self.last_call = dict(self.runner.last_call)
+
+
+def author_model(profile: TestProfile) -> str:
+    return profile.models.for_stage("author") if profile.models else ""
+
+
+def build_author_agent(cfg: HarnessConfig, profile: TestProfile) -> CliAuthorAgent:
+    """The T3 author from the harness config. Raises ValueError, before any call, when no agent runner is
+    configured, the author model breaks the model policy, or the CLI would pick its own model."""
+    rc = cfg.agent_runner
+    if rc is None:
+        raise ValueError("no agent runner configured for LLM stages; set agentRunner in the harness config "
+                         "(see examples/ath-config.yaml)")
+    model = author_model(profile)
+    if problem := load_policy(cfg.model_policy).problem([model], "author", profile.product):
+        raise ValueError(problem)
+    if problem := model_problem(cfg):
+        raise ValueError(problem)
+    skill = load_skill(cfg.skills_dir / "t03-author" / "SKILL.md")
+    if not skill.output_schema:
+        raise ValueError(f"{cfg.skills_dir / 't03-author' / 'SKILL.md'} has no output_schema")
+    return CliAuthorAgent(CliAgentRunner(rc), skill, model)

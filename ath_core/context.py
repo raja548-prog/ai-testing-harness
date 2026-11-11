@@ -16,6 +16,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+import yaml
+
 from ath_core.schemas.atrf import ATRFCase
 
 DIFF_CHARS = 8000
@@ -24,7 +26,8 @@ _STOP = {"the", "and", "for", "with", "got", "expected", "was", "but", "not", "t
          "src", "main", "com", "should", "when", "then", "that", "this", "from", "into", "are", "has"}
 
 
-def _tokens(text: str) -> set[str]:
+def tokens(text: str) -> set[str]:
+    """Words used to rank context by overlap: camelCase split, lower-cased, stop words dropped."""
     words = re.findall(r"[a-z][a-z0-9]{2,}", re.sub(r"([a-z])([A-Z])", r"\1 \2", text).lower())
     return {w for w in words if w not in _STOP}
 
@@ -33,7 +36,7 @@ def case_tokens(case: ATRFCase) -> set[str]:
     parts = [case.id, case.name, " ".join(case.tags)]
     if case.failure:
         parts += [case.failure.message, case.failure.trace[:1000]]
-    return _tokens(" ".join(parts))
+    return tokens(" ".join(parts))
 
 
 def split_diff(diff: str) -> list[tuple[str, str]]:
@@ -60,10 +63,16 @@ def split_diff(diff: str) -> list[tuple[str, str]]:
     return out
 
 
-def _pick(parts: list[tuple[str, str]], wanted: set[str], max_chars: int, what: str) -> str:
-    ranked = sorted(enumerate(parts), key=lambda ip: (-len(_tokens(ip[1][0] + " " + ip[1][1]) & wanted), ip[0]))
+def rank(parts: list[tuple[str, str]], wanted: set[str]) -> list[int]:
+    """Indices of (name, text) parts, most word overlap with `wanted` first; ties keep input order."""
+    return sorted(range(len(parts)), key=lambda i: (-len(tokens(parts[i][0] + " " + parts[i][1]) & wanted), i))
+
+
+def pick(parts: list[tuple[str, str]], wanted: set[str], max_chars: int, what: str) -> str:
+    """The parts most related to `wanted`, within max_chars, ending with "(N more <what> not shown)"."""
     chosen, used = [], 0
-    for _, (_, text) in ranked:
+    for i in rank(parts, wanted):
+        text = parts[i][1]
         if used + len(text) > max_chars and chosen:
             continue
         chosen.append(text[:max_chars])
@@ -76,7 +85,7 @@ def _pick(parts: list[tuple[str, str]], wanted: set[str], max_chars: int, what: 
 def diff_excerpt(diff: str, case: ATRFCase, max_chars: int = DIFF_CHARS) -> str:
     """The changed files most related to the failing case, within a size budget."""
     files = split_diff(diff)
-    return _pick(files, case_tokens(case), max_chars, "changed file(s)") if files else ""
+    return pick(files, case_tokens(case), max_chars, "changed file(s)") if files else ""
 
 
 @dataclass
@@ -97,7 +106,74 @@ def tsd_sections(md: str) -> list[TsdSection]:
 def tsd_excerpt(md: str, case: ATRFCase, max_chars: int = TSD_CHARS) -> str:
     """The TSD sections most related to the failing case, footers (ⓘ ids) included."""
     secs = tsd_sections(md)
-    return _pick([(s.title, s.text) for s in secs], case_tokens(case), max_chars, "TSD section(s)") if secs else ""
+    return pick([(s.title, s.text) for s in secs], case_tokens(case), max_chars, "TSD section(s)") if secs else ""
+
+
+# `ⓘ R-3 · AC-7`: requirement, acceptance-criterion and impact ids that Requirement-Harness writes.
+_FOOTER = re.compile(r"^\s*ⓘ\s*(.+?)\s*$", re.M)
+_CLAUSE_ID = re.compile(r"^(?:R|AC|IMP)-\d+$")
+
+
+def tsd_clause_ids(md: str) -> set[str]:
+    """Clause ids from the TSD's `ⓘ` footers (format `ⓘ R-3 · AC-7`)."""
+    ids: set[str] = set()
+    for m in _FOOTER.finditer(md):
+        ids |= {p.strip() for p in m.group(1).split("·") if _CLAUSE_ID.match(p.strip())}
+    return ids
+
+
+def select_tsd_sections(md: str, wanted: list[str]) -> str:
+    """The TSD sections named by title or by an `ⓘ` id; all of it when `wanted` is empty.
+
+    Raises ValueError for a name that matches no section, so a typo never silently sends nothing."""
+    if not wanted:
+        return md
+    secs = tsd_sections(md)
+    chosen: list[TsdSection] = []
+    for name in wanted:
+        n = name.strip()
+        hits = [s for s in secs if s.title.casefold() == n.casefold() or n in tsd_clause_ids(s.text)]
+        if not hits:
+            raise ValueError(f"--section {name!r} matches no TSD section title or ⓘ id")
+        chosen += [s for s in hits if s not in chosen]
+    order = {id(s): i for i, s in enumerate(secs)}
+    return "".join(s.text for s in sorted(chosen, key=lambda s: order[id(s)]))
+
+
+PRODUCT_SKILL_CHARS = 8000
+
+
+@dataclass
+class ProductSkill:
+    path: Path
+    text: str      # capped; ends with a note when cut
+    version: str   # front-matter `version`, "" when missing
+    meta: dict
+
+
+def read_front_matter(text: str) -> tuple[dict, str]:
+    """YAML front matter between leading `---` lines, and the body. ({}, text) when there is none."""
+    if not text.startswith("---"):
+        return {}, text
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return {}, text
+    meta = yaml.safe_load(parts[1]) or {}
+    return (meta if isinstance(meta, dict) else {}), parts[2]
+
+
+def load_product_skill(profile, max_chars: int = PRODUCT_SKILL_CHARS) -> ProductSkill | None:
+    """The profile's `productSkill` (path relative to the profile file), or None when not configured.
+
+    Shared by every LLM stage (T1, T3, T7, T10, T11). Raises OSError when it is configured but unreadable."""
+    rel = getattr(profile, "product_skill", None)
+    if not rel:
+        return None
+    path = profile.resolve_path(rel)
+    raw = path.read_text(encoding="utf-8")
+    meta, _ = read_front_matter(raw)
+    text = raw if len(raw) <= max_chars else raw[:max_chars] + f"\n({len(raw) - max_chars} more characters not shown)"
+    return ProductSkill(path=path, text=text, version=str(meta.get("version", "")), meta=meta)
 
 
 def read_rh_package(path: str | Path) -> str:

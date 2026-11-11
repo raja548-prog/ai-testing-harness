@@ -14,7 +14,10 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Callable, TypeVar
 
+from pathlib import Path
+
 from ath_core.schemas.atrf import ATRFRun
+from ath_core.schemas.authoring import AppliedResult, Proposal
 from ath_core.schemas.run import RunContext
 
 
@@ -141,17 +144,18 @@ class EnvLock(ABC):
 
 
 class TestAuthor(ABC):
-    """Persists new or changed test cases (Git MR, test-server API, simulator scenarios)."""
+    """Persists an approved T3 proposal (local checkout, Git MR, test-server API, simulator scenarios).
+
+    The authoring engine builds proposals (ath_core/authoring/engine.py); an adapter only applies one.
+    Before writing it re-checks that each base file is unchanged since the proposal and re-runs the
+    guards; if any file fails, it writes nothing."""
     __test__ = False
 
     def __init__(self, **params: Any):
         self.params = params
 
     @abstractmethod
-    def propose(self, cases: list[dict[str, Any]], ctx: RunContext) -> dict[str, Any]: ...
-
-    @abstractmethod
-    def apply(self, proposal: dict[str, Any], approved_by: str) -> str: ...
+    def apply(self, proposal: Proposal, base_dir: Path | None, approved_by: str) -> AppliedResult: ...
 
 
 T = TypeVar("T")

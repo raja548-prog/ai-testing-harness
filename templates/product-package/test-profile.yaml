@@ -35,9 +35,19 @@ selection:
   default: [smoke]
   rules: []
 
-testAuthoring:
-  mode: <git-mr|test-server-api|simulator-scenarios>
-  conventions: skills/<product>-test-conventions.md
+productSkill: skills/<product>-product-skill.md      # built from product-skill.md; used by every LLM stage
+
+testAuthoring:                                       # T3: create or update tests from the TSD
+  enabled: true                                      # a run's --author / --no-author overrides it
+  mode: <local-fs|git-mr|test-server-api|simulator-scenarios>   # only local-fs is built today
+  conventions: skills/<product>-test-conventions.md  # relative to this file
+  # Required for local-fs. Paths are globs relative to the test checkout.
+  # sources:
+  #   - { kind: code, paths: ["<src/test/**/*.java>"] }
+  #   - { kind: data, format: csv, paths: ["<testdata/**/*.csv>"], keyColumn: <test_id> }
+  # testData: <testdata/catalogue.yaml>             # approved test cards, accounts, mobiles, Aadhaar numbers
+  # codeContext: ["<src/main/java/**/*.java>"]       # relative to --code; default: the product skill's module paths
+  # templates: "<simulator/templates/**/*.yaml>"     # only for products with simulator scenarios
 
 logs:
   sources:

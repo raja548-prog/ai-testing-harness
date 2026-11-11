@@ -5,10 +5,11 @@ ATH service the same stage functions are wrapped as workflow activities (e.g. Te
 which adds durable timers, webhook signals and multi-day gate waits.
 
 Scaffold status:
-- Implemented: T2 selection, T4 env hold + deploy, T5 execute (MR + cached merge-base
-  baseline), T6 normalize with masking, T7 pre-checks + pluggable agent voting, T8 quorum,
-  T9 report, resume from checkpoints, structured events.
-- Stubbed: T1 impact (LLM), T3 authoring (LLM + gate), T10/T11 fix loop.
+- Implemented: T2 selection, T3 test authoring (local-fs: one proposal, behind its gate),
+  T4 env hold + deploy, T5 execute (MR + cached merge-base baseline), T6 normalize with masking,
+  T7 pre-checks + pluggable agent voting, T8 quorum, T9 report, resume from checkpoints,
+  structured events.
+- Stubbed: T1 impact (LLM), T10/T11 fix loop.
 """
 from __future__ import annotations
 
@@ -21,11 +22,13 @@ from typing import Any, Callable
 
 from ath_core.adapters import AdapterError, ExecStatus, MaskedLogs, RawResults, registry
 from ath_core.adapters import loader  # noqa: F401  (registers built-in adapters)
-from ath_core.context import diff_excerpt, tsd_excerpt
+from ath_core.authoring.engine import AuthorAgent, AuthorInputs, AuthoringEngine
+from ath_core.context import diff_excerpt, load_product_skill, tsd_excerpt
 from ath_core.gates import approval_problem, rejection_problem
 from ath_core.masking import Masker
 from ath_core.report.markdown import render_report
 from ath_core.schemas.atrf import ATRFCase, ATRFRun, Triage, TriageCategory
+from ath_core.schemas.authoring import Proposal
 from ath_core.schemas.profile import SuiteConfig, TestProfile
 from ath_core.schemas.run import (
     GateDecision, RunContext, RunManifest, RunMode, RunStatus, Stage, StageResult, StageStatus, utcnow,
@@ -53,13 +56,15 @@ class Orchestrator:
     def __init__(self, profile: TestProfile, store: StateStore, package_version: str = "dev",
                  agents: list[TriageAgent] | None = None, quarantined: set[str] | None = None,
                  report_dir: str | Path | None = None, profile_ref: str | None = None,
-                 quorum: int | None = None):
+                 quorum: int | None = None, author_factory: Callable[[], AuthorAgent] | None = None):
         self.profile = profile
         self.profile_ref = profile_ref
         self.store = store
         self.package_version = package_version
         self.agents = agents or []
         self.quorum = quorum  # None: default_quorum(len(agents))
+        # Builds the T3 author when T3 first needs a model call (it checks the model policy then).
+        self.author_factory = author_factory
         self.quarantined = quarantined or set()
         self.report_dir = Path(report_dir) if report_dir else None
         self.masker = Masker(categories=profile.logs.masking, correlation_keys=profile.correlation_keys())
@@ -92,9 +97,11 @@ class Orchestrator:
         self._load(run_id)  # KeyError for an unknown run
         return self._execute(run_id, force=force)
 
-    def approve(self, run_id: str, stage: Stage, user: str, groups: list[str], comment: str = "") -> RunManifest:
-        """Record an approval (separation of duties applies), then continue the run past the gate."""
-        self.record_gate(run_id, stage, "approved", user, groups, comment)
+    def approve(self, run_id: str, stage: Stage, user: str, groups: list[str], comment: str = "",
+                ref: str | None = None) -> RunManifest:
+        """Record an approval (separation of duties applies), then continue the run past the gate.
+        `ref`, if given, must be the hash of what is being approved (T3: the proposal hash)."""
+        self.record_gate(run_id, stage, "approved", user, groups, comment, ref=ref)
         return self._execute(run_id)
 
     def reject(self, run_id: str, stage: Stage, user: str, groups: list[str], comment: str = "") -> RunManifest:
@@ -102,26 +109,39 @@ class Orchestrator:
         return self.record_gate(run_id, stage, "rejected", user, groups, comment)
 
     def record_gate(self, run_id: str, stage: Stage, decision: str, user: str, groups: list[str],
-                    comment: str = "") -> RunManifest:
+                    comment: str = "", ref: str | None = None) -> RunManifest:
         """Check and record a gate decision without running anything (the API resumes in the background).
 
-        Raises PermissionError when the decider may not decide, ValueError if the profile changed.
+        Raises PermissionError when the decider may not decide, ValueError if the profile changed or
+        `ref` is not the hash of what waits for approval. A T3 approval records the proposal hash, so
+        T3 applies exactly the proposal that was approved.
         Check and write are one atomic step, so concurrent decisions cannot both pass."""
         rule = approval_problem if decision == "approved" else rejection_problem
+        current = None
+        if stage == Stage.T3_AUTHOR:
+            body = self.store.get_artifact(run_id, "author/proposal.json")
+            current = Proposal.model_validate_json(body).hash if body else None
+        if ref and stage != Stage.T3_AUTHOR:
+            raise ValueError(f"--ref applies to the T3 gate only, not {stage.value}")
+        if ref and ref != current:
+            raise ValueError(f"--ref {ref[:12]}... is not the stored T3 proposal "
+                             f"({current[:12] + '...' if current else 'none'}); review it again before deciding")
 
         def decide(m: RunManifest) -> None:
             if m.profile_hash != self._profile_hash():
                 raise ValueError(f"the profile changed since run {run_id} started; decide with the profile it ran with")
             if problem := rule(m, stage, user, groups, self.profile.owners):
                 raise PermissionError(problem)
-            m.gates.append(GateDecision(stage=stage, decision=decision, by=user, groups=groups, comment=comment))
+            m.gates.append(GateDecision(stage=stage, decision=decision, by=user, groups=groups, comment=comment,
+                                        ref=current))
             if decision == "rejected":
                 res = m.stages[stage]
                 res.status, res.error, res.finished_at = StageStatus.REJECTED, f"rejected by {user}: {comment}", utcnow()
                 m.status = RunStatus.REJECTED
 
         m = self.store.update_manifest(run_id, decide)
-        self.store.event(run_id, stage.value, f"gate.{decision}", by=user, groups=groups, comment=comment)
+        self.store.event(run_id, stage.value, f"gate.{decision}", by=user, groups=groups, comment=comment,
+                         **({"ref": current} if current else {}))
         if decision == "rejected":
             self.store.checkpoint(run_id, m.stages[stage])
             self._release_env(m.context)
@@ -265,12 +285,71 @@ class Orchestrator:
         suites = select_suites(self.profile, ctx.changed_paths)
         return {"suites": suites}
 
+    def _t3_skip(self, ctx: RunContext) -> str | None:
+        """Why T3 does not run in this run, or None."""
+        ta = self.profile.test_authoring
+        if ctx.mode == RunMode.REPORT_ONLY:
+            return "test authoring is off in report-only mode"
+        if ta is None:
+            return "the profile has no testAuthoring section"
+        if not (ctx.author if ctx.author is not None else ta.enabled):
+            return ("turned off for this run (--no-author)" if ctx.author is False
+                    else "turned off in the profile (testAuthoring.enabled: false)")
+        if ta.mode != "local-fs":
+            return f"mode {ta.mode} is not implemented yet"
+        if not ta.sources:
+            return "testAuthoring.sources is empty"
+        if not self.store.get_artifact(ctx.run_id, "context/tsd"):
+            return "no TSD given (--tsd or --rh-package)"
+        if not ctx.tests_dir:
+            return "no test checkout given (--tests)"
+        return None
+
     def t3_author(self, ctx: RunContext) -> dict[str, Any]:
-        if ctx.mode == RunMode.REPORT_ONLY or self.profile.test_authoring is None:
-            return {"_skipped": True, "reason": "test authoring disabled in this mode"}
-        if approved := self._approval(Stage.T3_AUTHOR):
-            return {"_skipped": True, "reason": f"test authoring is not implemented yet; gate approved by {approved.by}"}
-        raise GateRequired("T3: approve proposed test changes")
+        if reason := self._t3_skip(ctx):
+            return {"_skipped": True, "reason": reason}
+        # The proposal is made once: a resume, or a crash after the model call, reuses the stored one.
+        body = self.store.get_artifact(ctx.run_id, "author/proposal.json")
+        if body is None:
+            if self.author_factory is None:
+                return {"_skipped": True, "reason": "no agent runner configured for LLM stages"}
+            agent = self.author_factory()  # ValueError (e.g. the model policy) fails T3 before any call
+            code_dir = Path(ctx.code_dir) if ctx.code_dir else None
+            inputs = AuthorInputs(tsd=self.store.get_artifact(ctx.run_id, "context/tsd") or "",
+                                  tests_dir=Path(ctx.tests_dir), code_dir=code_dir,
+                                  diff=self.store.get_artifact(ctx.run_id, "context/diff"))
+            try:
+                drafted = AuthoringEngine(self.profile, agent).propose(inputs, source=f"run:{ctx.run_id}",
+                                                                       proposal_id=f"{ctx.run_id}-t3")
+            finally:  # audit: hashes, never content; failed calls too
+                if getattr(agent, "last_call", None):
+                    self.store.event(ctx.run_id, "T3", "agent.call", agent="cli-author", **agent.last_call)
+            proposal = drafted.proposal
+            self.store.put_artifact(ctx.run_id, "author/proposal.json", proposal.canonical_json())
+            self.store.put_artifact(ctx.run_id, "author/changes.patch", drafted.patch)
+            self.store.put_artifact(ctx.run_id, "author/checklist.md", drafted.checklist)
+            self.store.event(ctx.run_id, "T3", "author.proposed", proposal=proposal.hash,
+                             changes=len(proposal.changes), dropped=len(proposal.dropped),
+                             spec_questions=len(proposal.spec_questions))
+        else:
+            proposal = Proposal.model_validate_json(body)
+        h = proposal.hash
+        out: dict[str, Any] = {"proposal": h, "changes": [c.path for c in proposal.changes],
+                               "dropped": len(proposal.dropped), "spec_questions": len(proposal.spec_questions)}
+        if not proposal.changes:
+            return {**out, "applied": [], "reason": "no proposed change passed the guards; nothing to approve"}
+        approved = self._approval(Stage.T3_AUTHOR)
+        if approved is None:
+            raise GateRequired(f"T3: approve {len(proposal.changes)} proposed test change(s); proposal {h} "
+                               f"(review artifacts author/changes.patch and author/checklist.md)")
+        if approved.ref != h:
+            raise ValueError(f"proposal changed after approval: approved {str(approved.ref)[:12]}, stored {h[:12]}")
+        adapter = registry.create("author", self.profile.test_authoring.mode, profile=self.profile)
+        result = adapter.apply(proposal, Path(ctx.tests_dir), approved.by)
+        self.store.event(ctx.run_id, "T3", "author.applied", proposal=h, applied=result.applied,
+                         already_applied=result.already_applied, by=approved.by)
+        return {**out, "applied": result.applied, "already_applied": result.already_applied,
+                "approved_by": approved.by}
 
     def t4_env(self, ctx: RunContext) -> dict[str, Any]:
         lock_cfg = self.profile.policy.env_lock
@@ -342,6 +421,7 @@ class Orchestrator:
         counts: dict[str, int] = {}
         diff = self.store.get_artifact(ctx.run_id, "context/diff") or ""
         tsd = self.store.get_artifact(ctx.run_id, "context/tsd") or ""
+        product = self._product_skill(ctx)
         # Parsers mask case ids, so mask the listed ids the same way (own masker: not counted as hits).
         ids = Masker(categories=self.profile.logs.masking, correlation_keys=self.profile.correlation_keys())
         known = [k.model_copy(update={"case_id": ids.mask(k.case_id)}) for k in self.profile.policy.known_failures]
@@ -355,7 +435,7 @@ class Orchestrator:
             for case in remaining:
                 evidence = {"logs": self._logs_for(ctx, case).lines, "diff_ref": ctx.commit,
                             "diff": diff_excerpt(diff, case) if diff else "",
-                            "tsd": tsd_excerpt(tsd, case) if tsd else ""}
+                            "tsd": tsd_excerpt(tsd, case) if tsd else "", "product": product}
                 case.triage = vote(case, self.agents, evidence, self.quorum) if self.agents else None
                 for agent in self.agents:  # audit: one event per model call (hashes, never content)
                     if getattr(agent, "last_call", None):
@@ -383,7 +463,7 @@ class Orchestrator:
         notes = []
         if not self.agents:
             notes.append("LLM triage agents are not configured; unexplained failures are marked unknown.")
-        report = render_report(ctx, list(self._atrf.values()), notes)
+        report = render_report(ctx, list(self._atrf.values()), notes, authoring=self._authoring_summary(ctx))
         self.store.put_artifact(ctx.run_id, "report.md", report)
         path = None
         if self.report_dir:
@@ -408,6 +488,25 @@ class Orchestrator:
         return {"_skipped": True}
 
     # ---------------------------------------------------------------- helpers
+    def _product_skill(self, ctx: RunContext) -> str:
+        """The masked product skill for LLM evidence; "" when not configured or unreadable (recorded)."""
+        try:
+            skill = load_product_skill(self.profile)
+        except OSError as e:
+            self.store.event(ctx.run_id, "T7", "context.missing", input="productSkill", error=str(e))
+            return ""
+        return self.masker.mask(skill.text) if skill else ""
+
+    def _authoring_summary(self, ctx: RunContext) -> dict[str, Any] | None:
+        """What T3 did, for the report; None when T3 was skipped because it does not apply to the run."""
+        res = self._m.stages.get(Stage.T3_AUTHOR)
+        if res is None:
+            return None
+        body = self.store.get_artifact(ctx.run_id, "author/proposal.json")
+        return {"status": res.status.value, "reason": res.output.get("reason", ""),
+                "applied": res.output.get("applied", []), "approved_by": res.output.get("approved_by"),
+                "proposal": Proposal.model_validate_json(body) if body else None}
+
     def _wait(self, poll: Callable[[], ExecStatus], timeout_min: float,
               max_interval: float = DEFAULT_POLL_SEC) -> ExecStatus:
         """Poll until the job leaves RUNNING or the timeout passes, backing off between checks."""

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
 from ath_core.masking import CATEGORIES as MASK_CATEGORIES
 
@@ -85,11 +85,77 @@ class Selection(_Model):
     rules: list[SelectionRule] = Field(default_factory=list)
 
 
-class TestAuthoring(_Model):
+class TestSource(_Model):
+    """One kind of file in the test checkout that T3 may create or update.
+
+    `kind: code` is test code (edited as text). `kind: data` holds test data or transactions, edited by
+    format: csv/tsv by row operations, json/yaml by text edits that must still parse.
+    Paths are globs relative to the test checkout (`**` spans folders)."""
     __test__ = False
-    mode: Literal["git-mr", "test-server-api", "simulator-scenarios"]
+    kind: Literal["code", "data"]
+    format: Literal["text", "csv", "tsv", "json", "yaml"] | None = None
+    paths: list[str] = Field(min_length=1)
+    key_column: str | None = Field(None, alias="keyColumn")  # csv/tsv: the column `update_row` matches on
+
+    @model_validator(mode="after")
+    def _format_fits_kind(self) -> "TestSource":
+        if self.kind == "code" and self.format not in (None, "text"):
+            raise ValueError(f"a code source is edited as text; format {self.format!r} needs kind: data")
+        if self.kind == "data" and self.format in (None, "text"):
+            raise ValueError("a data source needs format: csv, tsv, json or yaml")
+        if self.key_column and self.format not in ("csv", "tsv"):
+            raise ValueError("keyColumn only applies to csv and tsv sources")
+        for g in self.paths:
+            if g.startswith("/") or ".." in Path(g).parts:
+                raise ValueError(f"source path {g!r} must be relative to the test checkout, without '..'")
+        return self
+
+    @property
+    def edit_format(self) -> str:
+        return self.format or "text"
+
+
+class AuthoringLimits(_Model):
+    """Size caps for T3: what is sent to the model and what it may change."""
+    max_changes: int = Field(20, alias="maxChanges", ge=1, le=200)               # files per proposal
+    max_change_chars: int = Field(60000, alias="maxChangeChars", ge=100)         # content or edits per file
+    test_files: int = Field(15, alias="testFiles", ge=1, le=200)                 # `tests` block: whole files
+    tests_chars: int = Field(40000, alias="testsChars", ge=1000)
+    tree_paths: int = Field(400, alias="treePaths", ge=10)
+    tsd_chars: int = Field(20000, alias="tsdChars", ge=1000)
+    conventions_chars: int = Field(8000, alias="conventionsChars", ge=500)
+    product_chars: int = Field(8000, alias="productChars", ge=500)
+    code_chars: int = Field(12000, alias="codeChars", ge=500)
+    templates_chars: int = Field(8000, alias="templatesChars", ge=500)
+    diff_chars: int = Field(8000, alias="diffChars", ge=500)
+    outdated_chars: int = Field(6000, alias="outdatedChars", ge=500)
+
+
+class TestAuthoring(_Model):
+    """T3: create or update tests from the TSD. Only `local-fs` is built; the other modes validate,
+    and T3 skips them. Relative paths: `conventions` from the profile file; `sources`, `testData` and
+    `templates` from the test checkout; `codeContext` from the code checkout."""
+    __test__ = False
+    enabled: bool = True  # a run's --author / --no-author overrides it
+    mode: Literal["local-fs", "git-mr", "test-server-api", "simulator-scenarios"]
     framework: str | None = None
     conventions: str | None = None
+    sources: list[TestSource] = Field(default_factory=list)
+    test_data: str | None = Field(None, alias="testData")              # approved test-data catalogue
+    code_context: list[str] = Field(default_factory=list, alias="codeContext")
+    templates: list[str] = Field(default_factory=list)                  # simulator template globs
+    limits: AuthoringLimits = Field(default_factory=AuthoringLimits)
+
+    @field_validator("templates", "code_context", mode="before")
+    @classmethod
+    def _one_or_many(cls, v: Any) -> Any:
+        return [v] if isinstance(v, str) else v
+
+    @model_validator(mode="after")
+    def _sources_for_local_fs(self) -> "TestAuthoring":
+        if self.mode == "local-fs" and not self.sources:
+            raise ValueError("testAuthoring.mode local-fs needs sources: which test files T3 may change")
+        return self
 
 
 class LogsConfig(_Model):
@@ -168,6 +234,9 @@ class TestProfile(_Model):
     logs: LogsConfig
     policy: Policy
     models: Models | None = None
+    # Product skill shared by every LLM stage (path relative to this profile file).
+    product_skill: str | None = Field(None, alias="productSkill")
+    _source: Path | None = PrivateAttr(None)  # the file it was loaded from; not part of the profile hash
 
     @field_validator("api_version")
     @classmethod
@@ -175,6 +244,17 @@ class TestProfile(_Model):
         if v not in SUPPORTED_API_VERSIONS:
             raise ValueError(f"unsupported apiVersion {v!r}; supported: {sorted(SUPPORTED_API_VERSIONS)}")
         return v
+
+    @property
+    def source(self) -> Path | None:
+        return self._source
+
+    def resolve_path(self, rel: str | Path) -> Path:
+        """A path from the profile, relative to the profile file (to the working directory if unknown)."""
+        p = Path(rel)
+        if p.is_absolute() or self._source is None:
+            return p
+        return self._source.parent / p
 
     def correlation_keys(self) -> list[str]:
         """Correlation keys the product declares on its log sources (e.g. rrn, stan, batchId)."""
@@ -211,6 +291,7 @@ class TestProfile(_Model):
 def load_profile(path: str | Path) -> TestProfile:
     data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
     profile = TestProfile.model_validate(data)
+    profile._source = Path(path)
     problems = profile.check_references()
     if problems:
         raise ValueError("invalid test profile: " + "; ".join(problems))

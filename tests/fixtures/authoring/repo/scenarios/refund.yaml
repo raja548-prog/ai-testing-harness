@@ -1,0 +1,4 @@
+# Refund scenario: reverses the original fee
+scenario: refund-full
+amount: "1000.00"   # original purchase
+expectedFee: "-12.50"

@@ -5,8 +5,10 @@ sent to a model. Masking is regex + checksum based, never model based.
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
+from typing import Callable, NamedTuple
 
 # Runs of 13+ digits, optionally separated by single spaces or dashes. Which part of a run is the PAN is
 # decided in _pan, so a PAN followed by an expiry or amount, or behind a length prefix, is still found.
@@ -28,6 +30,56 @@ _AADHAAR_RE = re.compile(r"(?<!\d)[2-9]\d{3}[\s-]?\d{4}[\s-]?\d{4}(?!\d)")
 _MOBILE_RE = re.compile(r"(?<!\d)(?:\+91[ -]?|0)?[6-9]\d{9}(?!\d)")
 
 CATEGORIES = ("pan", "cvv", "track2", "aadhaar", "mobile")
+
+
+class Span(NamedTuple):
+    """One masked region: original text [orig_start, orig_end) became masked text [masked_start, masked_end)."""
+    orig_start: int
+    orig_end: int
+    masked_start: int
+    masked_end: int
+    category: str
+
+
+def _common_prefix(a: str, b: str) -> str:
+    return os.path.commonprefix([a, b])
+
+
+def _compose(spans: list[Span], changes: list[tuple[int, int, int, str]]) -> None:
+    """Fold one pass's changes into `spans`.
+
+    Before the call, `spans` (earlier passes) and `changes` ((start, end, new_len, category), sorted,
+    not overlapping) are both in positions of the text this pass ran on. Afterwards `spans` is in
+    positions of the pass's output. A change that overlaps an earlier span absorbs it, so every span
+    still maps back to a whole original region."""
+    old = sorted(spans)
+
+    def grow(s: Span) -> int:  # how much longer the masked region is than the original
+        return (s.masked_end - s.masked_start) - (s.orig_end - s.orig_start)
+
+    def to_orig(pos: int, edge: str) -> int:
+        for s in old:
+            if s.masked_start < pos < s.masked_end:  # inside an earlier region: take all of it
+                return s.orig_start if edge == "start" else s.orig_end
+        return pos - sum(grow(s) for s in old if s.masked_end <= pos)
+
+    out: list[Span] = []
+    absorbed: set[Span] = set()
+    shift = 0  # growth of this pass's output before the current position
+    for start, end, new_len, cat in changes:
+        inside = [s for s in old if s.masked_start < end and s.masked_end > start]
+        absorbed.update(inside)
+        o_start = min([to_orig(start, "start")] + [s.orig_start for s in inside])
+        o_end = max([to_orig(end, "end")] + [s.orig_end for s in inside])
+        cats = "+".join(dict.fromkeys([*(s.category for s in inside), cat]))
+        out.append(Span(o_start, o_end, start + shift, start + shift + new_len, cats))
+        shift += new_len - (end - start)
+    for s in old:
+        if s in absorbed:
+            continue
+        moved = sum(n - (e - b) for b, e, n, _ in changes if e <= s.masked_start)
+        out.append(s._replace(masked_start=s.masked_start + moved, masked_end=s.masked_end + moved))
+    spans[:] = sorted(out, key=lambda s: s.masked_start)
 
 
 _VERHOEFF_D = [
@@ -95,21 +147,51 @@ class Masker:
         return "[AADHAAR]"
 
     def mask(self, text: str) -> str:
-        if not text:
-            return text
+        return self._run(text, None) if text else text
+
+    def mask_spans(self, text: str) -> tuple[str, list[Span]]:
+        """Mask, and say where: each Span maps a masked region of the output back to the original.
+
+        Regions are as tight as the replacement allows (`cvv=123` -> `cvv=***` covers only `123`).
+        Text outside every span is copied unchanged, so a position there maps by a fixed offset."""
+        spans: list[Span] = []
+        return (self._run(text, spans) if text else text), spans
+
+    def _run(self, text: str, spans: list[Span] | None) -> str:
         cats = set(self.categories)
+        passes: list[tuple[str, re.Pattern[str], Callable[[re.Match[str]], str]]] = []
         if "track2" in cats:
-            text = _TRACK2_RE.sub(self._track2, text)
+            passes.append(("track2", _TRACK2_RE, self._track2))
         if "pan" in cats:
-            text = _PAN_RE.sub(self._pan, text)
+            passes.append(("pan", _PAN_RE, self._pan))
         if "cvv" in cats:
-            text = _CVV_RE.sub(lambda m: (self._count("cvv"), f"{m.group(1)}{m.group(2)}***")[1], text)
+            passes.append(("cvv", _CVV_RE, lambda m: (self._count("cvv"), f"{m.group(1)}{m.group(2)}***")[1]))
         # PIN blocks are always masked, whatever the profile says.
-        text = _PINBLOCK_RE.sub(lambda m: (self._count("pinblock"), f"{m.group(1)}{m.group(2)}[PINBLOCK]")[1], text)
+        passes.append(("pinblock", _PINBLOCK_RE,
+                       lambda m: (self._count("pinblock"), f"{m.group(1)}{m.group(2)}[PINBLOCK]")[1]))
         if "aadhaar" in cats:
-            text = _AADHAAR_RE.sub(self._aadhaar, text)
+            passes.append(("aadhaar", _AADHAAR_RE, self._aadhaar))
         if "mobile" in cats:
-            text = _MOBILE_RE.sub(lambda m: (self._count("mobile"), "[MOBILE]")[1], text)
+            passes.append(("mobile", _MOBILE_RE, lambda m: (self._count("mobile"), "[MOBILE]")[1]))
+        for cat, regex, fn in passes:
+            if spans is None:
+                text = regex.sub(fn, text)
+                continue
+            out, changes, pos = [], [], 0
+            for m in regex.finditer(text):
+                rep = fn(m)
+                old = m.group(0)
+                if rep == old:
+                    continue
+                pre = len(_common_prefix(old, rep))
+                suf = len(_common_prefix(old[pre:][::-1], rep[pre:][::-1]))
+                start, end = m.start() + pre, m.end() - suf
+                out += [text[pos:start], rep[pre:len(rep) - suf]]
+                changes.append((start, end, len(rep) - pre - suf, cat))
+                pos = end
+            if changes:
+                text = "".join(out) + text[pos:]
+                _compose(spans, changes)
         return text
 
     def _pan(self, m: re.Match[str]) -> str:

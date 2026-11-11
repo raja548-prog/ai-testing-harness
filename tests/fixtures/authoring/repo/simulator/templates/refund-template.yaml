@@ -1,0 +1,6 @@
+# Approved simulator template for refunds. Fill parameters only.
+template: refund
+parameters: [amount, expectedFee, card]
+steps:
+  - send: purchase
+  - send: refund

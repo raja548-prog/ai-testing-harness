@@ -51,8 +51,10 @@ Not everything is built yet. Plan your onboarding around this table:
 | GitLab CI adapter | Skeleton |
 | Department env-booking adapter | Not built: only the demo `fake-lock` exists |
 | Posting the report to the MR and Jira | Not built: the report goes to a file and the API |
-| T1 impact, T3 test authoring, T10 fix, T11 validation | Gates work; the LLM work behind them is not built |
-| Profile fields `build`, `healthCheck`, `quarantineList`, `testAuthoring`, product skill | Validated but not used by runs yet |
+| T3 test authoring from a TSD (`ainxt-ath author`, and T3 in runs behind its gate) | Ready for `testAuthoring.mode: local-fs`; `git-mr` is not built |
+| Product skill (`productSkill`) | Ready: sent to T3 and to the T7 voters |
+| T1 impact, T10 fix, T11 validation | Gates work; the LLM work behind them is not built |
+| Profile fields `build`, `healthCheck`, `quarantineList` | Validated but not used by runs yet |
 
 ---
 
@@ -150,7 +152,7 @@ Copy [`templates/product-package/`](../templates/product-package/). It contains 
 | File | Purpose |
 | --- | --- |
 | `test-profile.yaml` | The onboarding contract. Section 5.2 describes every field. |
-| `product-skill.md` | What an LLM needs to know about the product: modules, transactions, how to read its logs, known flaky areas. Fill it in now; runs don't use it yet. |
+| `product-skill.md` | What an LLM needs to know about the product: modules, transactions, how to read its logs, known flaky areas. Point the profile's `productSkill` at it; T3 and T7 send it to their models. |
 | `AGENTS.md` | Rules for agents working on the product. Keep the defaults. |
 
 The template mentions some adapters that aren't built yet: `test-server-api`, `simulator`, `allure-json`, `cucumber-json` and `dept-env-booking`. Section 10.3 lists what exists today.
@@ -293,6 +295,45 @@ policy:
 `envLock` holds the department's test environment for the run. Leave it out until your department's booking adapter exists, because only the demo `fake-lock` is built.
 
 A `knownFailures` entry stops applying after its `expires` date.
+
+#### `productSkill` and `testAuthoring`: T3 test authoring
+
+```yaml
+productSkill: skills/settlenxt-product-skill.md   # relative to the profile; needs front matter with a version
+
+testAuthoring:
+  enabled: true                 # a run's --author / --no-author overrides it
+  mode: local-fs                # only local-fs is built; git-mr, test-server-api, simulator-scenarios are skipped
+  conventions: skills/settlenxt-test-conventions.md   # relative to the profile
+  sources:                      # which files T3 may change; globs relative to the test checkout
+    - { kind: code, paths: ["src/test/**/*.java"] }
+    - { kind: data, format: csv,  paths: ["testdata/**/*.csv"], keyColumn: test_id }
+    - { kind: data, format: json, paths: ["scenarios/**/*.json"] }
+    - { kind: data, format: yaml, paths: ["scenarios/**/*.yaml"] }
+  testData: testdata/catalogue.yaml   # relative to the test checkout
+  codeContext: ["src/main/java/**/clearing/**/*.java"]   # relative to --code; default: the product skill's module paths
+  templates: "simulator/templates/**/*.yaml"              # simulator products only
+  limits: { maxChanges: 20, testFiles: 15, testsChars: 40000 }   # optional caps
+```
+
+`sources` is required for `local-fs`. `kind: code` files are edited by find/replace; `kind: data` files
+by format: CSV/TSV by row operations (`add_row`, and `update_row` on the `keyColumn`), JSON/YAML by
+find/replace that must still parse. Nothing outside these globs can be changed: no source, build or CI files.
+
+The test-data catalogue is the only place card, account, mobile and Aadhaar values come from. The model
+sees names, kinds, descriptions and field names, never values, and writes `{{testdata:visa-credit-01.pan}}`;
+ATH fills in the value when it writes the file. `doctor --tests <checkout>` checks that it parses, names
+are unique, card PANs pass Luhn and Aadhaar numbers pass Verhoeff:
+
+```yaml
+entries:
+  - { name: visa-credit-01, kind: card, description: "Visa credit, domestic, active",
+      values: { pan: "4111111111111111", expiry: "12/30", cvv: "123" } }
+  - { name: customer-mobile-01, kind: mobile, description: "OTP flows", values: { number: "9876543210" } }
+```
+
+The author stage sends `restricted` data (masked test files and failure messages), so its model must be
+allowed for that class by the model policy.
 
 #### `models`: which model each LLM stage uses
 
@@ -511,6 +552,28 @@ A category needs `quorum` agreeing votes (default: a strict majority of the vote
 
 T10 runs only when triage found `code-regression` failures; otherwise it is skipped.
 
+T3 runs in `assist` and `autofix` when the profile's `testAuthoring.enabled` is on (or the run has
+`--author`, and not `--no-author`), the mode is `local-fs`, the run has a TSD (`--tsd` or
+`--rh-package`) and a test checkout (`--tests`). Otherwise it is skipped with the reason. It calls the
+author model once and stores `author/proposal.json`, `author/changes.patch` and `author/checklist.md`
+with the run; a resume reuses them. If no change passed the guards it finishes without a gate.
+Authored tests are written to the local checkout after approval; they do not run in T5 of the same run yet.
+
+### 7.3a Create or update tests without a run
+
+```bash
+ainxt-ath author --profile test-profile.yaml --tests ./checkout --tsd tsd.md --dry-run
+ainxt-ath author apply <id> --profile test-profile.yaml --tests ./checkout
+```
+
+Give the TSD with `--tsd`, `--rh-package` or `--from-run <runId>` (which also sends the tests that run's
+triage marked `test-outdated`, and reuses its TSD and diff). Limit it with `--section <title or ⓘ id>`
+(repeatable). Add `--code <code checkout>` so new tests call methods that exist, and `--diff` so the model
+sees which behaviour changed. Without `--dry-run` the changes are written at once. Either way ATH prints
+the changes, what it dropped and why, review flags and spec questions, and saves the proposal under
+`.ath/authoring/<id>/` (`--out` to change). Review with `git diff`, then commit or open an MR as usual:
+the test repo's own review is the gate here.
+
 ### 7.4 Approve or reject a gate
 
 A run that reaches a gate stops with status `waiting-gate`:
@@ -529,6 +592,9 @@ The rules:
 - **No service approvals.** Service identities (`ath-…`, `svc-…`) and the default `local-user` can't decide.
 - **Rejecting is open to more people.** The person who triggered the run, or any owner, may reject. A rejected run stops for good; its artifacts are kept and the environment hold is released.
 - **Same profile.** A decision is refused if the profile changed since the run started.
+- **The reviewed proposal.** A T3 approval records the proposal hash shown at the gate, and T3 applies
+  only that proposal. Pass `--ref <hash>` to refuse the approval if the stored proposal is not the one
+  you reviewed (API: `{"ref": "<hash>"}` in the body).
 
 `--groups` stands in for the user's SSO groups until SSO is wired.
 
@@ -621,9 +687,11 @@ A run makes 3 CLI sessions per case, one after another, so allow time for it.
 | Command | Purpose | Exit code |
 | --- | --- | --- |
 | `validate <profile>` | Schema and cross-checks | 0 ok, 1 invalid |
-| `doctor <profile> [--config]` | Plus adapters, settings, secrets, agent CLI, model policy | 0 ok, 2 problems |
-| `run --profile … --commit … --merge-base … --env …` | Start a run | 0 succeeded or waiting at a gate, 1 otherwise |
-| `approve` / `reject <runId> --gate --user [--groups] [--comment]` | Decide a gate | 0 done, 1 refused |
+| `doctor <profile> [--config] [--tests] [--code]` | Plus adapters, settings, secrets, agent CLI, model policy, product skill, test authoring | 0 ok, 2 problems |
+| `run --profile … --commit … --merge-base … --env … [--tests] [--code] [--author\|--no-author]` | Start a run | 0 succeeded or waiting at a gate, 1 otherwise |
+| `approve` / `reject <runId> --gate --user [--groups] [--comment]` | Decide a gate; `approve --ref <hash>` pins the T3 proposal | 0 done, 1 refused |
+| `author --profile … --tests … (--tsd … \| --rh-package … \| --from-run …) [--section] [--code] [--diff] [--dry-run] [--force]` | Create or update tests from a TSD in a local checkout | 0 applied or proposed, 1 refused, 4 only spec questions, 5 every change dropped |
+| `author apply <id> --profile … --tests … [--force]` | Apply a stored proposal, no model call | 0 applied, 1 refused |
 | `resume <runId> --profile … [--force]` | Continue a run; `--force` takes over a run whose process died | 0 or 1 |
 | `report <runId>` / `events <runId>` | Print the report or the audit trail | 0 or 1 |
 | `eval <dataset> --profile … [--min-accuracy] [--max-missed-regressions] [--max-error-rate]` | Score triage. Fails if over 10% of voter calls error, or an injection case gets no working vote | 0 pass, 1 refused, 3 a gate failed |
@@ -646,5 +714,6 @@ A run makes 3 CLI sessions per case, one after another, so allow time for it.
 | Result parser | `jenkins-test-report`, `junit-xml` |
 | Log source | `log-api`; `ssh` (skeleton); `fake-logs` (demo) |
 | Env lock | `fake-lock` (demo only) |
+| Test author | `local-fs`; `git-mr` (skeleton) |
 
 To add an adapter, see "Adding an adapter" in the [README](../README.md).

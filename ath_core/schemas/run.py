@@ -66,6 +66,12 @@ class RunContext(BaseModel):
     changed_paths: list[str] = Field(default_factory=list)
     triggered_by: str  # SSO user id
     trigger_source: str = "cli"  # cli | web | adlc | schedule
+    # T3 test authoring. None follows the profile's testAuthoring.enabled; --author / --no-author override.
+    author: bool | None = None
+    # Local checkouts on the machine running the orchestrator (--tests, --code). Part of the inputs:
+    # the same run id with another path is a different run.
+    tests_dir: str | None = None
+    code_dir: str | None = None
 
 
 class StageResult(BaseModel):
@@ -84,6 +90,7 @@ class GateDecision(BaseModel):
     by: str
     groups: list[str] = Field(default_factory=list)
     comment: str = ""
+    ref: str | None = None  # hash of what was approved (T3: the proposal hash)
     at: datetime = Field(default_factory=utcnow)
 
 

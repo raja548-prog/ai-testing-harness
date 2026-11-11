@@ -19,6 +19,17 @@ selection:
   rules:
     - when: { pathsChanged: ["**/clearing/**"] }
       run:  [smoke, regression]
+productSkill: skills/settlenxt-product-skill.md
+testAuthoring:            # T3 against a local checkout, e.g. --tests tests/fixtures/authoring/repo (copy it first)
+  mode: local-fs
+  conventions: skills/settlenxt-test-conventions.md
+  sources:
+    - { kind: code, paths: ["src/test/**/*.java"] }
+    - { kind: data, format: csv, paths: ["testdata/**/*.csv"], keyColumn: test_id }
+    - { kind: data, format: json, paths: ["scenarios/**/*.json"] }
+    - { kind: data, format: yaml, paths: ["scenarios/**/*.yaml"] }
+  testData: testdata/catalogue.yaml
+  templates: "simulator/templates/**/*.yaml"
 logs:
   sources:
     - { adapter: log-api, keys: [rrn, stan, batchId] }   # no endpoint: falls back to the next source

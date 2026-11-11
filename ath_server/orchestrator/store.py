@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id 
 class StateStore:
     def __init__(self, path: str | Path = ":memory:"):
         self._lock = threading.RLock()
+        self.db_path = str(path)
         self.db = sqlite3.connect(str(path), check_same_thread=False)
         self.db.executescript(_SCHEMA)
 

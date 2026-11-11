@@ -66,7 +66,9 @@ API: `ATH_PROFILES=examples/settlenxt uvicorn ath_server.api.app:app --reload`, 
 | Log sources: log-api (HTTP), ssh (server-only, skeleton), fake | Partly |
 | Jenkins adapter (webhook or API trigger, test-report or artifact results) | Done; tested against a mock Jenkins |
 | GitLab adapter | Skeleton |
-| T1 impact, T3 authoring, T10 remediation, T11 validation (LLM) | Stubs + skills drafted |
+| T3 test authoring from a TSD: standalone `ainxt-ath author`, and in runs behind the T3 gate | Done for `local-fs` (code, CSV, JSON, YAML); `git-mr` not built |
+| Product skill shared by LLM stages (`productSkill`) | Done; reaches T3 and T7 |
+| T1 impact, T10 remediation, T11 validation (LLM) | Stubs + skills drafted |
 
 ## Next steps
 
@@ -78,7 +80,8 @@ API: `ATH_PROFILES=examples/settlenxt uvicorn ath_server.api.app:app --reload`, 
 3. **Service hardening**: Postgres store, SSO JWT validation and run-scoped tokens, credential
    broker for Git/Jira, and durable workflows (e.g. Temporal) wrapping the stage functions.
 4. **More parsers**: allure-json, testng, cucumber-json, and the simulator CSV format.
-5. **LLM stages**: T1 → T3 (behind its gate) → T10/T11 in `assist` mode.
+5. **LLM stages**: T1 → T10/T11 in `assist` mode; T3 `git-mr` (push a branch and open an MR on the
+   test repo), and running the authored tests in T5.
 
 ## Using the AiNxt CLI for LLM stages
 
@@ -115,7 +118,7 @@ Each vote must also quote, character for character, a line from the data ATH sen
 line, TSD clause or the failure message). ATH checks the quote; a vote with no quote or an invented one
 is discarded as `unknown`, with a note in the ATRF. Verified quotes appear as evidence in the report.
 Set `minFamilies` with `modelFamilies` to require voters from different model families. Today
-this drives T7 triage; T1, T3, T10 and T11 will use the same runner.
+this drives T7 triage and T3 test authoring; T1, T10 and T11 will use the same runner.
 
 ## Approval gates
 
@@ -133,6 +136,36 @@ the approver must be a named person in one of the profile's `owners` groups; ser
 CLI's default user cannot decide. Anyone who may decide can reject; a rejected run stops with its
 artifacts kept and its env hold released. A decision made with a changed profile is refused.
 `--groups` and `X-ATH-Groups` stand in for SSO groups until SSO is wired.
+
+## Test authoring from a TSD (T3)
+
+Testers can create or update tests from a TSD in a local checkout of the test suite, with no run,
+MR, deploy or environment:
+
+```bash
+ainxt-ath author --profile <p> --tests ./checkout --tsd tsd.md [--section AC-7] [--code ./code] [--diff mr.diff]
+ainxt-ath author --profile <p> --tests ./checkout --tsd tsd.md --dry-run   # propose only
+ainxt-ath author apply <id> --profile <p> --tests ./checkout                # apply it later, no model call
+ainxt-ath author --profile <p> --tests ./checkout --from-run <runId>       # fix tests triage marked test-outdated
+```
+
+ATH sends one masked, size-capped context (TSD clauses, the related test files sent whole, the
+checkout's paths, conventions, the test-data catalogue's names, the product skill, and optionally source
+signatures, simulator templates, the diff and outdated tests) to skill `t03-author`, then checks every
+change the model returns: paths stay inside `testAuthoring.sources`, each change cites `ⓘ` clause ids of
+the TSD, edits never touch masked data, CSV files change by row operations only, JSON/YAML still parse,
+and card, account, mobile and Aadhaar values come only from the approved catalogue as
+`{{testdata:<name>.<field>}}` references. Changes that fail are dropped with the reason. Weakened
+assertions, `@Disabled`, new imports and network or process calls are flagged in `checklist.md`.
+The proposal, `changes.patch` (masked) and `checklist.md` go under `.ath/authoring/<id>/`.
+Exit codes: 0 applied (or proposed with `--dry-run`), 1 refused, 4 only spec questions, 5 every change
+dropped. Without `--force` it refuses target files with uncommitted changes, and a checkout that is not a
+Git repository.
+
+In a run, T3 does the same before deploy: `ainxt-ath run ... --mode assist --tsd tsd.md --tests ./checkout`
+stops at the T3 gate with the proposal stored once, and `ainxt-ath approve <runId> --gate T3 --ref <hash>`
+applies exactly that proposal. The profile's `testAuthoring.enabled` switches it on or off; `--author`
+and `--no-author` override it for one run. Only `mode: local-fs` is built; other modes are skipped.
 
 ## Change context for triage
 

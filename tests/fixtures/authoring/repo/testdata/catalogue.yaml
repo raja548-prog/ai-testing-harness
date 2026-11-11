@@ -1,0 +1,22 @@
+# Approved test data. Values never reach a model; tests reference them as {{testdata:<name>.<field>}}.
+entries:
+  - name: visa-credit-01
+    kind: card
+    description: Visa credit, domestic, active
+    values: {pan: "4111111111111111", expiry: "12/30", cvv: "123"}
+  - name: mc-debit-01
+    kind: card
+    description: Mastercard debit, domestic, active
+    values: {pan: "5500005555555559", expiry: "11/29", cvv: "456"}
+  - name: merchant-acct-01
+    kind: account
+    description: Merchant settlement account
+    values: {number: "001234567890", ifsc: "SNXB0000001"}
+  - name: customer-mobile-01
+    kind: mobile
+    description: Customer mobile for OTP flows
+    values: {number: "9876543210"}
+  - name: customer-aadhaar-01
+    kind: aadhaar
+    description: Test Aadhaar number (UIDAI test range)
+    values: {number: "234567890124"}

@@ -55,10 +55,21 @@ selection:
     - when: { pathsChanged: ["**/clearing/**"] }
       run:  [smoke, regression]
 
-testAuthoring:
-  mode: git-mr
+productSkill: skills/settlenxt-product-skill.md   # shared by every LLM stage (relative to this file)
+
+testAuthoring:            # T3: create or update tests from the TSD
+  enabled: true           # a run's --author / --no-author overrides it
+  mode: git-mr            # not built yet: runs skip T3. `local-fs` writes into a local checkout (--tests)
   framework: testng-cucumber
   conventions: skills/settlenxt-test-conventions.md
+  # Needed for local-fs; paths are relative to the test checkout.
+  # sources:
+  #   - { kind: code, paths: ["src/test/**/*.java"] }
+  #   - { kind: data, format: csv, paths: ["testdata/**/*.csv"], keyColumn: test_id }
+  #   - { kind: data, format: json, paths: ["scenarios/**/*.json"] }
+  #   - { kind: data, format: yaml, paths: ["scenarios/**/*.yaml"] }
+  # testData: testdata/catalogue.yaml   # approved test cards, accounts, mobiles, Aadhaar numbers
+  codeContext: ["src/main/java/**/clearing/**/*.java", "src/main/java/**/model/**/*.java"]   # relative to --code
 
 logs:
   sources:
@@ -78,4 +89,5 @@ policy:
 models:                   # per stage, configurable; local models preferred
   default:   local/onprem-coder
   triage:    local/onprem-reasoner
+  author:    local/onprem-coder
   remediate: local/onprem-coder

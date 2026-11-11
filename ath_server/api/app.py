@@ -40,10 +40,14 @@ class RunRequest(BaseModel):
     profile_file: str = "test-profile.local.yaml"
     diff: str | None = None  # unified diff of the MR, for triage context
     tsd: str | None = None   # TSD markdown, for triage context
+    # T3 test authoring: None follows the profile. The server has no test checkout yet, so T3 is skipped
+    # here ("no test checkout given") until git-mr can clone the test repo.
+    author: bool | None = None
 
 
 class GateRequest(BaseModel):
     comment: str = ""
+    ref: str | None = None  # T3 approve: the proposal hash reviewed; refused (409) if the stored one differs
 
 
 def _user(x_ath_user: str | None) -> str:
@@ -72,7 +76,7 @@ def create_run(req: RunRequest, bg: BackgroundTasks, x_ath_user: str | None = He
     orch = _orchestrator(req.product, req.profile_file)
     ctx = RunContext(run_id=f"ath-{uuid.uuid4().hex[:10]}", product=req.product, mode=req.mode, mr=req.mr,
                      jira=req.jira, commit=req.commit, merge_base=req.merge_base, env=req.env,
-                     changed_paths=req.changed_paths, triggered_by=user, trigger_source="web")
+                     changed_paths=req.changed_paths, triggered_by=user, trigger_source="web", author=req.author)
     try:
         orch.check(ctx)  # refuse now: once queued, a refusal would only surface as a run that never appears
     except ValueError as e:
@@ -100,7 +104,8 @@ def decide_gate(run_id: str, gate: str, action: str, req: GateRequest, bg: Backg
     groups = [g.strip() for g in (x_ath_groups or "").split(",") if g.strip()]
     decision = "approved" if action == "approve" else "rejected"
     try:
-        orch.record_gate(run_id, Stage(gate), decision, user, groups, req.comment)
+        orch.record_gate(run_id, Stage(gate), decision, user, groups, req.comment,
+                         ref=req.ref if decision == "approved" else None)
     except PermissionError as e:
         raise HTTPException(403, str(e))
     except ValueError as e:
