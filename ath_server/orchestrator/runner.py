@@ -22,13 +22,16 @@ from typing import Any, Callable
 
 from ath_core.adapters import AdapterError, ExecStatus, MaskedLogs, RawResults, registry
 from ath_core.adapters import loader  # noqa: F401  (registers built-in adapters)
-from ath_core.authoring.engine import AuthorAgent, AuthorInputs, AuthoringEngine
+from ath_core.authoring.engine import (
+    PLAN_SKILL, SKILL, AuthorAgent, AuthorInputs, AuthoringEngine, Workspace, answer_sheet, answers_from,
+    apply_plan_edits, plan_yaml, render_plan_md,
+)
 from ath_core.context import diff_excerpt, load_product_skill, tsd_excerpt
 from ath_core.gates import approval_problem, rejection_problem
 from ath_core.masking import Masker
 from ath_core.report.markdown import render_report
 from ath_core.schemas.atrf import ATRFCase, ATRFRun, Triage, TriageCategory
-from ath_core.schemas.authoring import Proposal
+from ath_core.schemas.authoring import Clarification, Proposal, TestPlan
 from ath_core.schemas.profile import SuiteConfig, TestProfile
 from ath_core.schemas.run import (
     GateDecision, RunContext, RunManifest, RunMode, RunStatus, Stage, StageResult, StageStatus, utcnow,
@@ -52,18 +55,25 @@ class GateRequired(Exception):
     """Raised when a run reaches a HITL gate; the run parks until approved."""
 
 
+def _next_edit_id(plan_id: str) -> str:
+    """The id of a tester-edited version: `<id>-e1`, then `<id>-e2`."""
+    base, _, n = plan_id.rpartition("-e")
+    return f"{base}-e{int(n) + 1}" if base and n.isdigit() else f"{plan_id}-e1"
+
+
 class Orchestrator:
     def __init__(self, profile: TestProfile, store: StateStore, package_version: str = "dev",
                  agents: list[TriageAgent] | None = None, quarantined: set[str] | None = None,
                  report_dir: str | Path | None = None, profile_ref: str | None = None,
-                 quorum: int | None = None, author_factory: Callable[[], AuthorAgent] | None = None):
+                 quorum: int | None = None, author_factory: Callable[[str], AuthorAgent] | None = None):
         self.profile = profile
         self.profile_ref = profile_ref
         self.store = store
         self.package_version = package_version
         self.agents = agents or []
         self.quorum = quorum  # None: default_quorum(len(agents))
-        # Builds the T3 author when T3 first needs a model call (it checks the model policy then).
+        # Builds the T3 agent for a skill (t03-plan, t03-author) when T3 needs a model call; it checks the
+        # model policy then.
         self.author_factory = author_factory
         self.quarantined = quarantined or set()
         self.report_dir = Path(report_dir) if report_dir else None
@@ -108,32 +118,94 @@ class Orchestrator:
         """Stop the run at a gate. Artifacts are kept; the env hold is released."""
         return self.record_gate(run_id, stage, "rejected", user, groups, comment)
 
+    def answer(self, run_id: str, user: str, groups: list[str], ref: str | None,
+               answers: list[dict[str, Any]] | None = None, plan_yaml_text: str | None = None) -> RunManifest:
+        """Answer T3's spec questions (T3 plans again) or edit its plan (no model call), then continue
+        the run; it parks at the plan gate again. Not an approval."""
+        self.record_answer(run_id, user, groups, ref, answers, plan_yaml_text)
+        return self._execute(run_id)
+
+    def record_answer(self, run_id: str, user: str, groups: list[str], ref: str | None,
+                      answers: list[dict[str, Any]] | None = None, plan_yaml_text: str | None = None) -> TestPlan:
+        """Store answers or a tester-edited plan for a run waiting at the T3 plan gate, without running
+        anything (the API resumes in the background). Returns the plan the input applies to.
+
+        Whoever may reject the gate may answer (the run's trigger or an owner). `ref` must be the hash
+        of the stored plan: the answers are to the questions that were read. Raises PermissionError or
+        ValueError."""
+        m = self._load(run_id)
+        if problem := rejection_problem(m, Stage.T3_AUTHOR, user, groups, self.profile.owners):
+            raise PermissionError(problem)
+        if m.profile_hash != self._profile_hash():
+            raise ValueError(f"the profile changed since run {run_id} started; answer with the profile it ran with")
+        if bool(answers) == (plan_yaml_text is not None):
+            raise ValueError("give answers to the spec questions or an edited plan, one of them")
+        subject, current = self._t3_subject(run_id)
+        if subject != "plan":
+            raise ValueError(f"run {run_id} has no T3 plan waiting for approval; answers and plan edits go "
+                             f"before the plan is approved")
+        if ref != current:
+            raise ValueError(f"--ref {str(ref)[:12]}... is not the stored T3 plan ({current[:12]}...); "
+                             f"read it again before answering")
+        plan = TestPlan.model_validate_json(self.store.get_artifact(run_id, "author/plan.json"))
+        ws = Workspace(self.profile, m.context.tests_dir)
+        archive = f"author/rounds/{plan.id}"
+        if answers:
+            if plan.round >= self.profile.test_authoring.limits.max_rounds:
+                raise ValueError(f"T3 planned {plan.round} round(s), the limit (testAuthoring.limits.maxRounds); "
+                                 f"approve or edit this plan, or update the TSD and start a new run")
+            new = answers_from(answers, plan, user, ws.masker.mask)
+            if not new:
+                raise ValueError("every answer is empty; nothing to plan again with")
+            self.store.put_artifact(run_id, f"{archive}/plan.json", plan.canonical_json())
+            self.store.put_artifact(run_id, "author/answers.json", {
+                "round": plan.round + 1, "parent": f"{archive}/plan.json",
+                "clarifications": [c.model_dump(mode="json") for c in [*plan.clarifications, *new]]})
+            self.store.put_artifact(run_id, "author/plan.json", "")  # T3 plans again on resume
+            self.store.event(run_id, "T3", "author.answered", plan=current, by=user, answered=[c.id for c in new],
+                             answers_sha256=hashlib.sha256(json.dumps(
+                                 [c.answer for c in new]).encode()).hexdigest())
+            return plan
+        edited = apply_plan_edits(plan, plan_yaml_text, ws, user, new_id=_next_edit_id(plan.id))
+        if edited is None:
+            raise ValueError("the edited plan is the same as the stored one")
+        self.store.put_artifact(run_id, f"{archive}/plan.json", plan.canonical_json())
+        self.store.put_artifact(run_id, "author/plan.json", edited.canonical_json())
+        self.store.put_artifact(run_id, "author/plan.md", render_plan_md(edited))
+        self.store.put_artifact(run_id, "author/plan.yaml", plan_yaml(edited))
+        self.store.event(run_id, "T3", "author.plan_edited", plan=edited.hash, parent=current, by=user,
+                         items=[i.id for i in edited.items if i.edited or i.origin == "tester"])
+        return edited
+
     def record_gate(self, run_id: str, stage: Stage, decision: str, user: str, groups: list[str],
                     comment: str = "", ref: str | None = None) -> RunManifest:
         """Check and record a gate decision without running anything (the API resumes in the background).
 
         Raises PermissionError when the decider may not decide, ValueError if the profile changed or
-        `ref` is not the hash of what waits for approval. A T3 approval records the proposal hash, so
-        T3 applies exactly the proposal that was approved.
+        `ref` is not the hash of what waits for approval. T3 has two gates: its test plan, then its
+        proposal. A T3 approval records the hash of the one waiting, so T3 generates from exactly the
+        approved plan and applies exactly the approved proposal.
         Check and write are one atomic step, so concurrent decisions cannot both pass."""
-        rule = approval_problem if decision == "approved" else rejection_problem
-        current = None
+        current = subject = None
         if stage == Stage.T3_AUTHOR:
-            body = self.store.get_artifact(run_id, "author/proposal.json")
-            current = Proposal.model_validate_json(body).hash if body else None
+            subject, current = self._t3_subject(run_id)
         if ref and stage != Stage.T3_AUTHOR:
             raise ValueError(f"--ref applies to the T3 gate only, not {stage.value}")
         if ref and ref != current:
-            raise ValueError(f"--ref {ref[:12]}... is not the stored T3 proposal "
+            raise ValueError(f"--ref {ref[:12]}... is not the stored T3 {subject or 'proposal'} "
                              f"({current[:12] + '...' if current else 'none'}); review it again before deciding")
 
         def decide(m: RunManifest) -> None:
             if m.profile_hash != self._profile_hash():
                 raise ValueError(f"the profile changed since run {run_id} started; decide with the profile it ran with")
-            if problem := rule(m, stage, user, groups, self.profile.owners):
+            if decision == "approved":
+                problem = approval_problem(m, stage, user, groups, self.profile.owners, subject)
+            else:
+                problem = rejection_problem(m, stage, user, groups, self.profile.owners)
+            if problem:
                 raise PermissionError(problem)
             m.gates.append(GateDecision(stage=stage, decision=decision, by=user, groups=groups, comment=comment,
-                                        ref=current))
+                                        ref=current, subject=subject))
             if decision == "rejected":
                 res = m.stages[stage]
                 res.status, res.error, res.finished_at = StageStatus.REJECTED, f"rejected by {user}: {comment}", utcnow()
@@ -141,7 +213,7 @@ class Orchestrator:
 
         m = self.store.update_manifest(run_id, decide)
         self.store.event(run_id, stage.value, f"gate.{decision}", by=user, groups=groups, comment=comment,
-                         **({"ref": current} if current else {}))
+                         **({"ref": current} if current else {}), **({"subject": subject} if subject else {}))
         if decision == "rejected":
             self.store.checkpoint(run_id, m.stages[stage])
             self._release_env(m.context)
@@ -156,8 +228,20 @@ class Orchestrator:
     def _profile_hash(self) -> str:
         return hashlib.sha256(self.profile.model_dump_json().encode()).hexdigest()[:16]
 
-    def _approval(self, stage: Stage) -> GateDecision | None:
-        return next((g for g in self._m.gates if g.stage == stage and g.decision == "approved"), None)
+    def _approval(self, stage: Stage, subject: str | None = None) -> GateDecision | None:
+        return next((g for g in self._m.gates
+                     if g.stage == stage and g.decision == "approved" and g.subject == subject), None)
+
+    def _t3_subject(self, run_id: str) -> tuple[str | None, str | None]:
+        """(what T3 waits on, its hash): ("proposal", h) once a proposal exists, ("plan", h) before.
+        A proposal from a run parked before the plan step has subject None."""
+        body = self.store.get_artifact(run_id, "author/proposal.json")
+        plan_body = self.store.get_artifact(run_id, "author/plan.json")
+        if body:
+            return ("proposal" if plan_body else None), Proposal.model_validate_json(body).hash
+        if plan_body:
+            return "plan", TestPlan.model_validate_json(plan_body).hash
+        return None, None
 
     # ---------------------------------------------------------------- core loop
     def _plan(self, mode: RunMode) -> list[tuple[Stage, Callable[[RunContext], dict[str, Any]]]]:
@@ -305,22 +389,82 @@ class Orchestrator:
             return "no test checkout given (--tests)"
         return None
 
+    def _t3_inputs(self, ctx: RunContext, plan: TestPlan | None = None) -> AuthorInputs:
+        answers = self._t3_answers(ctx)
+        return AuthorInputs(tsd=self.store.get_artifact(ctx.run_id, "context/tsd") or "",
+                            tests_dir=Path(ctx.tests_dir), code_dir=Path(ctx.code_dir) if ctx.code_dir else None,
+                            diff=self.store.get_artifact(ctx.run_id, "context/diff"),
+                            clarifications=plan.clarifications if plan else answers["clarifications"], plan=plan)
+
+    def _t3_answers(self, ctx_or_id: RunContext | str) -> dict[str, Any]:
+        """author/answers.json: the round to plan next, the plan it follows, and every answer so far."""
+        run_id = ctx_or_id if isinstance(ctx_or_id, str) else ctx_or_id.run_id
+        body = self.store.get_artifact(run_id, "author/answers.json")
+        data = json.loads(body) if body else {}
+        return {"round": data.get("round", 1), "parent": data.get("parent", ""),
+                "clarifications": [Clarification.model_validate(c) for c in data.get("clarifications", [])]}
+
+    def _t3_plan(self, ctx: RunContext) -> TestPlan:
+        """The T3 test plan, made once per round: a resume reuses the stored one."""
+        body = self.store.get_artifact(ctx.run_id, "author/plan.json")
+        if body:
+            return TestPlan.model_validate_json(body)
+        answers = self._t3_answers(ctx)
+        parent_body = self.store.get_artifact(ctx.run_id, answers["parent"]) if answers["parent"] else None
+        parent = TestPlan.model_validate_json(parent_body) if parent_body else None
+        agent = self.author_factory(PLAN_SKILL)  # ValueError (e.g. the model policy) fails T3 before any call
+        try:
+            drafted = AuthoringEngine(self.profile, planner=agent).plan(
+                self._t3_inputs(ctx), source=f"run:{ctx.run_id}", plan_id=f"{ctx.run_id}-plan-{answers['round']}",
+                parent=parent)
+        finally:  # audit: hashes, never content; failed calls too
+            if getattr(agent, "last_call", None):
+                self.store.event(ctx.run_id, "T3", "agent.call", agent="cli-planner", **agent.last_call)
+        plan = drafted.plan
+        self.store.put_artifact(ctx.run_id, "author/plan.json", plan.canonical_json())
+        self.store.put_artifact(ctx.run_id, "author/plan.md", drafted.markdown)
+        self.store.put_artifact(ctx.run_id, "author/plan.yaml", plan_yaml(plan))
+        self.store.put_artifact(ctx.run_id, "author/answers.yaml", answer_sheet(plan) if plan.spec_questions else "")
+        self.store.event(ctx.run_id, "T3", "author.planned", plan=plan.hash, round=plan.round, items=len(plan.items),
+                         dropped=len(plan.dropped), spec_questions=len(plan.spec_questions))
+        return plan
+
     def t3_author(self, ctx: RunContext) -> dict[str, Any]:
         if reason := self._t3_skip(ctx):
             return {"_skipped": True, "reason": reason}
-        # The proposal is made once: a resume, or a crash after the model call, reuses the stored one.
         body = self.store.get_artifact(ctx.run_id, "author/proposal.json")
-        if body is None:
-            if self.author_factory is None:
-                return {"_skipped": True, "reason": "no agent runner configured for LLM stages"}
-            agent = self.author_factory()  # ValueError (e.g. the model policy) fails T3 before any call
-            code_dir = Path(ctx.code_dir) if ctx.code_dir else None
-            inputs = AuthorInputs(tsd=self.store.get_artifact(ctx.run_id, "context/tsd") or "",
-                                  tests_dir=Path(ctx.tests_dir), code_dir=code_dir,
-                                  diff=self.store.get_artifact(ctx.run_id, "context/diff"))
+        plan_body = self.store.get_artifact(ctx.run_id, "author/plan.json")
+        if not body and not plan_body and self.author_factory is None:
+            return {"_skipped": True, "reason": "no agent runner configured for LLM stages"}
+        out: dict[str, Any] = {}
+        plan: TestPlan | None = None
+        if body and not plan_body:
+            pass  # a run parked at T3 before the plan step: its proposal goes on as it was
+        else:
+            # Gate 1: the test plan. Answers and plan edits replace it until it is approved.
+            plan = self._t3_plan(ctx)
+            ph = plan.hash
+            out.update(plan=ph, plan_items=len(plan.items), spec_questions=len(plan.spec_questions))
+            if not plan.items and not plan.spec_questions:
+                return {**out, "applied": [], "reason": "the plan has no items and no questions; nothing to author"}
+            approved_plan = self._approval(Stage.T3_AUTHOR, "plan")
+            if approved_plan is None:
+                questions = (f"; {len(plan.spec_questions)} open spec question(s): answer them with "
+                             f"`ainxt-ath answer {ctx.run_id}` (artifact author/answers.yaml)" if plan.spec_questions
+                             else "")
+                raise GateRequired(f"T3 plan: approve {len(plan.items)} test plan item(s); plan {ph}{questions} "
+                                   f"(review artifact author/plan.md; edit with `ainxt-ath answer --plan`)")
+            if approved_plan.ref != ph:
+                raise ValueError(f"plan changed after approval: approved {str(approved_plan.ref)[:12]}, stored {ph[:12]}")
+            if not plan.items:
+                return {**out, "applied": [], "reason": "the approved plan has no items; nothing to author"}
+        # Gate 2: the proposal, made once from the approved plan: a resume, or a crash after the model
+        # call, reuses the stored one.
+        if not body:
+            agent = self.author_factory(SKILL)
             try:
-                drafted = AuthoringEngine(self.profile, agent).propose(inputs, source=f"run:{ctx.run_id}",
-                                                                       proposal_id=f"{ctx.run_id}-t3")
+                drafted = AuthoringEngine(self.profile, agent).propose(
+                    self._t3_inputs(ctx, plan), source=f"run:{ctx.run_id}", proposal_id=f"{ctx.run_id}-t3")
             finally:  # audit: hashes, never content; failed calls too
                 if getattr(agent, "last_call", None):
                     self.store.event(ctx.run_id, "T3", "agent.call", agent="cli-author", **agent.last_call)
@@ -334,11 +478,11 @@ class Orchestrator:
         else:
             proposal = Proposal.model_validate_json(body)
         h = proposal.hash
-        out: dict[str, Any] = {"proposal": h, "changes": [c.path for c in proposal.changes],
-                               "dropped": len(proposal.dropped), "spec_questions": len(proposal.spec_questions)}
+        out.update(proposal=h, changes=[c.path for c in proposal.changes], dropped=len(proposal.dropped))
+        out.setdefault("spec_questions", len(proposal.spec_questions))
         if not proposal.changes:
             return {**out, "applied": [], "reason": "no proposed change passed the guards; nothing to approve"}
-        approved = self._approval(Stage.T3_AUTHOR)
+        approved = self._approval(Stage.T3_AUTHOR, "proposal" if plan else None)
         if approved is None:
             raise GateRequired(f"T3: approve {len(proposal.changes)} proposed test change(s); proposal {h} "
                                f"(review artifacts author/changes.patch and author/checklist.md)")
@@ -503,9 +647,13 @@ class Orchestrator:
         if res is None:
             return None
         body = self.store.get_artifact(ctx.run_id, "author/proposal.json")
+        plan_body = self.store.get_artifact(ctx.run_id, "author/plan.json")
+        plan_ok = self._approval(Stage.T3_AUTHOR, "plan")
         return {"status": res.status.value, "reason": res.output.get("reason", ""),
                 "applied": res.output.get("applied", []), "approved_by": res.output.get("approved_by"),
-                "proposal": Proposal.model_validate_json(body) if body else None}
+                "proposal": Proposal.model_validate_json(body) if body else None,
+                "plan": TestPlan.model_validate_json(plan_body) if plan_body else None,
+                "plan_approved_by": plan_ok.by if plan_ok else None}
 
     def _wait(self, poll: Callable[[], ExecStatus], timeout_min: float,
               max_interval: float = DEFAULT_POLL_SEC) -> ExecStatus:

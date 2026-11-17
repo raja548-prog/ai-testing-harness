@@ -144,27 +144,36 @@ MR, deploy or environment:
 
 ```bash
 ainxt-ath author --profile <p> --tests ./checkout --tsd tsd.md [--section AC-7] [--code ./code] [--diff mr.diff]
-ainxt-ath author --profile <p> --tests ./checkout --tsd tsd.md --dry-run   # propose only
+ainxt-ath author answer <plan-id> --profile <p> --tests ./checkout          # plan again with answers.yaml
+ainxt-ath author generate <plan-id> --profile <p> --tests ./checkout --dry-run   # tests for the (edited) plan
 ainxt-ath author apply <id> --profile <p> --tests ./checkout                # apply it later, no model call
 ainxt-ath author --profile <p> --tests ./checkout --from-run <runId>       # fix tests triage marked test-outdated
 ```
 
-ATH sends one masked, size-capped context (TSD clauses, the related test files sent whole, the
+It works in two phases. First skill `t03-plan` makes a **test plan**: scenarios with their TSD clauses,
+expected results and target files, plus spec questions (each with the model's assumption) for clauses the
+TSD leaves unclear. At a terminal ATH asks the questions, plans again with the answers, shows the plan and
+asks before generating; otherwise it saves `plan.md`, an editable `plan.yaml` and an `answers.yaml` to
+fill in, and prints the next command. Answers refine a clause without editing the TSD (an RH-package TSD
+stays hash-locked); changes resting on them are flagged for review. `--yes` runs both phases in one step.
+
+Then ATH sends one masked, size-capped context (TSD clauses, the related test files sent whole, the
 checkout's paths, conventions, the test-data catalogue's names, the product skill, and optionally source
-signatures, simulator templates, the diff and outdated tests) to skill `t03-author`, then checks every
-change the model returns: paths stay inside `testAuthoring.sources`, each change cites `ⓘ` clause ids of
+signatures, simulator templates, the diff and outdated tests) to skill `t03-author`, with the approved plan, then checks
+every change the model returns: it implements an approved plan item, paths stay inside `testAuthoring.sources`, each change cites `ⓘ` clause ids of
 the TSD, edits never touch masked data, CSV files change by row operations only, JSON/YAML still parse,
 and card, account, mobile and Aadhaar values come only from the approved catalogue as
 `{{testdata:<name>.<field>}}` references. Changes that fail are dropped with the reason. Weakened
 assertions, `@Disabled`, new imports and network or process calls are flagged in `checklist.md`.
 The proposal, `changes.patch` (masked) and `checklist.md` go under `.ath/authoring/<id>/`.
-Exit codes: 0 applied (or proposed with `--dry-run`), 1 refused, 4 only spec questions, 5 every change
-dropped. Without `--force` it refuses target files with uncommitted changes, and a checkout that is not a
+Exit codes: 0 applied (or proposed with `--dry-run`), 1 refused, 4 open spec questions, 5 every change
+dropped, 6 plan waiting for review. Without `--force` it refuses target files with uncommitted changes, and a checkout that is not a
 Git repository.
 
 In a run, T3 does the same before deploy: `ainxt-ath run ... --mode assist --tsd tsd.md --tests ./checkout`
-stops at the T3 gate with the proposal stored once, and `ainxt-ath approve <runId> --gate T3 --ref <hash>`
-applies exactly that proposal. The profile's `testAuthoring.enabled` switches it on or off; `--author`
+stops first at the T3 plan gate (answer questions or edit the plan with `ainxt-ath answer <runId>`, then
+`ainxt-ath approve <runId> --gate T3 --ref <plan hash>`), then at the proposal gate, where
+`ainxt-ath approve <runId> --gate T3 --ref <proposal hash>` applies exactly that proposal. The profile's `testAuthoring.enabled` switches it on or off; `--author`
 and `--no-author` override it for one run. Only `mode: local-fs` is built; other modes are skipped.
 
 ## Change context for triage

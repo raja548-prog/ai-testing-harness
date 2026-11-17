@@ -313,7 +313,7 @@ testAuthoring:
   testData: testdata/catalogue.yaml   # relative to the test checkout
   codeContext: ["src/main/java/**/clearing/**/*.java"]   # relative to --code; default: the product skill's module paths
   templates: "simulator/templates/**/*.yaml"              # simulator products only
-  limits: { maxChanges: 20, testFiles: 15, testsChars: 40000 }   # optional caps
+  limits: { maxChanges: 20, testFiles: 15, testsChars: 40000, maxRounds: 3 }   # optional caps
 ```
 
 `sources` is required for `local-fs`. `kind: code` files are edited by find/replace; `kind: data` files
@@ -554,23 +554,67 @@ T10 runs only when triage found `code-regression` failures; otherwise it is skip
 
 T3 runs in `assist` and `autofix` when the profile's `testAuthoring.enabled` is on (or the run has
 `--author`, and not `--no-author`), the mode is `local-fs`, the run has a TSD (`--tsd` or
-`--rh-package`) and a test checkout (`--tests`). Otherwise it is skipped with the reason. It calls the
-author model once and stores `author/proposal.json`, `author/changes.patch` and `author/checklist.md`
-with the run; a resume reuses them. If no change passed the guards it finishes without a gate.
-Authored tests are written to the local checkout after approval; they do not run in T5 of the same run yet.
+`--rh-package`) and a test checkout (`--tests`). Otherwise it is skipped with the reason. T3 has two
+phases, each behind its own gate:
+
+1. **Plan.** One call to skill `t03-plan` turns the TSD into a test plan: one item `TP-n` per scenario,
+   with its TSD clauses, expected result and target test file, plus spec questions (`Q-n`, each with the
+   model's own assumption) for clauses the TSD leaves unclear. They are stored as `author/plan.md`,
+   `author/plan.yaml` and `author/answers.yaml`, and the run waits at the **plan gate**. While it waits:
+   - answer the questions, and T3 plans again with the answers (up to `testAuthoring.limits.maxRounds`,
+     default 3, planning rounds):
+     `ainxt-ath answer <runId> --user … --answers answers.yaml --profile …` (or no `--answers`, at a
+     terminal, to be asked);
+   - or send an edited plan (remove items, change an expected result, add an item), no model call:
+     `ainxt-ath answer <runId> --user … --plan plan.yaml --profile …`;
+   - then approve it: `ainxt-ath approve <runId> --gate T3 --ref <plan hash> …`. A plan can be approved
+     with questions still open; their clauses are simply not planned. Approving a plan with no items
+     ends T3 without authoring.
+2. **Generate.** One call to skill `t03-author` writes the tests for the approved items only; a change
+   that implements no approved item is dropped. It stores `author/proposal.json`, `author/changes.patch`
+   and `author/checklist.md` (with a plan-coverage table), and the run waits at the **proposal gate**:
+   `ainxt-ath approve <runId> --gate T3 --ref <proposal hash> …`. If no change passed the guards it
+   finishes without this gate.
+
+Answers never edit the TSD (an `--rh-package` TSD stays hash-locked). They are stored as
+clarifications, shown in the plan, checklist and report, and every change whose expected values rest on
+one, or on a tester's plan edit, gets a review flag. Send them to the TSD owner so the TSD catches up.
+Anyone who may reject the gate (the run's trigger or an owner) may answer. Read the review artifacts with
+`ainxt-ath report <runId> --artifact author/plan.md` (or `GET /runs/{id}/artifacts/author/plan.md`);
+answer through the API with `POST /runs/{id}/gates/T3/answer` and
+`{"ref": "<plan hash>", "answers": [{"id": "Q-1", "answer": "…"}]}` or `{"ref": …, "plan_yaml": "…"}`.
+A resume reuses the stored plan and proposal. Authored tests are written to the local checkout after
+approval; they do not run in T5 of the same run yet.
 
 ### 7.3a Create or update tests without a run
 
 ```bash
-ainxt-ath author --profile test-profile.yaml --tests ./checkout --tsd tsd.md --dry-run
-ainxt-ath author apply <id> --profile test-profile.yaml --tests ./checkout
+ainxt-ath author --profile test-profile.yaml --tests ./checkout --tsd tsd.md --dry-run   # plan
+ainxt-ath author answer <plan-id> --profile test-profile.yaml --tests ./checkout          # after answers.yaml
+ainxt-ath author generate <plan-id> --profile test-profile.yaml --tests ./checkout --dry-run
+ainxt-ath author apply <proposal-id> --profile test-profile.yaml --tests ./checkout
 ```
+
+ATH first makes a **test plan** (`plan-…`) and stops before writing any test code:
+
+- **At a terminal** it asks each spec question in turn (type an answer, `a` to accept the model's
+  assumption, Enter to skip), plans again with your answers, shows the plan, and asks
+  `Generate tests for N plan item(s)? [Y]es / [n]o / [e]dit plan.yaml`. `e` opens `$EDITOR`.
+- **Without a terminal** (or with `--no-input`) it saves `plan.md`, `plan.yaml` and `answers.yaml` under
+  `.ath/authoring/<plan-id>/`, prints the next command, and exits 4 (open spec questions) or 6 (plan
+  ready for review). Fill in `answer:` in `answers.yaml` (`accept` takes the assumption) and run
+  `author answer <plan-id>`: it plans again with the same inputs and your answers, with no need to edit
+  the TSD. Edit `plan.yaml` if needed, then run `author generate <plan-id>`.
+- `--yes` approves a plan with no open questions and generates at once (one step, for scripts).
+
+Answers refine a clause; they are not part of the signed-off TSD. Changes resting on them are flagged
+for review, and the checklist lists them for the TSD owner.
 
 Give the TSD with `--tsd`, `--rh-package` or `--from-run <runId>` (which also sends the tests that run's
 triage marked `test-outdated`, and reuses its TSD and diff). Limit it with `--section <title or ⓘ id>`
 (repeatable). Add `--code <code checkout>` so new tests call methods that exist, and `--diff` so the model
-sees which behaviour changed. Without `--dry-run` the changes are written at once. Either way ATH prints
-the changes, what it dropped and why, review flags and spec questions, and saves the proposal under
+sees which behaviour changed. Without `--dry-run` the generated changes are written at once. Either way
+ATH prints the changes, what it dropped and why, and review flags, and saves the proposal under
 `.ath/authoring/<id>/` (`--out` to change). Review with `git diff`, then commit or open an MR as usual:
 the test repo's own review is the gate here.
 
@@ -592,9 +636,10 @@ The rules:
 - **No service approvals.** Service identities (`ath-…`, `svc-…`) and the default `local-user` can't decide.
 - **Rejecting is open to more people.** The person who triggered the run, or any owner, may reject. A rejected run stops for good; its artifacts are kept and the environment hold is released.
 - **Same profile.** A decision is refused if the profile changed since the run started.
-- **The reviewed proposal.** A T3 approval records the proposal hash shown at the gate, and T3 applies
-  only that proposal. Pass `--ref <hash>` to refuse the approval if the stored proposal is not the one
-  you reviewed (API: `{"ref": "<hash>"}` in the body).
+- **The reviewed plan and proposal.** T3 has two gates. A T3 approval records the hash shown at the
+  gate: the plan hash at the plan gate, then the proposal hash. T3 generates only from that plan and
+  applies only that proposal. Pass `--ref <hash>` to refuse the approval if the stored plan or proposal
+  is not the one you reviewed (API: `{"ref": "<hash>"}` in the body).
 
 `--groups` stands in for the user's SSO groups until SSO is wired.
 
@@ -689,11 +734,14 @@ A run makes 3 CLI sessions per case, one after another, so allow time for it.
 | `validate <profile>` | Schema and cross-checks | 0 ok, 1 invalid |
 | `doctor <profile> [--config] [--tests] [--code]` | Plus adapters, settings, secrets, agent CLI, model policy, product skill, test authoring | 0 ok, 2 problems |
 | `run --profile … --commit … --merge-base … --env … [--tests] [--code] [--author\|--no-author]` | Start a run | 0 succeeded or waiting at a gate, 1 otherwise |
-| `approve` / `reject <runId> --gate --user [--groups] [--comment]` | Decide a gate; `approve --ref <hash>` pins the T3 proposal | 0 done, 1 refused |
-| `author --profile … --tests … (--tsd … \| --rh-package … \| --from-run …) [--section] [--code] [--diff] [--dry-run] [--force]` | Create or update tests from a TSD in a local checkout | 0 applied or proposed, 1 refused, 4 only spec questions, 5 every change dropped |
+| `approve` / `reject <runId> --gate --user [--groups] [--comment]` | Decide a gate; `approve --ref <hash>` pins the T3 plan, then the T3 proposal | 0 done, 1 refused |
+| `answer <runId> --user [--groups] (--answers … \| --plan …) [--ref] --profile …` | T3 in a run: answer the plan's spec questions (T3 plans again) or send an edited plan; prompts at a terminal | 0 done, 1 refused |
+| `author --profile … --tests … (--tsd … \| --rh-package … \| --from-run …) [--section] [--code] [--diff] [--dry-run] [--force] [--yes] [--no-input]` | Plan, then create or update tests from a TSD in a local checkout | 0 applied or proposed, 1 refused, 4 open spec questions, 5 every change dropped, 6 plan waiting for review |
+| `author answer <plan-id> --profile … --tests … [--answers]` | Plan again with the answers in `answers.yaml` | as `author` |
+| `author generate <plan-id> --profile … --tests … [--plan] [--dry-run] [--force]` | Write the tests of a plan (with your `plan.yaml` edits) | 0 applied or proposed, 1 refused, 4, 5 |
 | `author apply <id> --profile … --tests … [--force]` | Apply a stored proposal, no model call | 0 applied, 1 refused |
 | `resume <runId> --profile … [--force]` | Continue a run; `--force` takes over a run whose process died | 0 or 1 |
-| `report <runId>` / `events <runId>` | Print the report or the audit trail | 0 or 1 |
+| `report <runId> [--artifact author/plan.md\|…]` / `events <runId>` | Print the report, a T3 review artifact, or the audit trail | 0 or 1 |
 | `eval <dataset> --profile … [--min-accuracy] [--max-missed-regressions] [--max-error-rate]` | Score triage. Fails if over 10% of voter calls error, or an injection case gets no working vote | 0 pass, 1 refused, 3 a gate failed |
 
 ### 10.2 Environment variables

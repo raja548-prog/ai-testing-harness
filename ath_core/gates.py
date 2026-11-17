@@ -5,7 +5,7 @@ Approve (T3 test changes, T10 redeploy of a fix, T11 verdict):
   - a named person decides; service identities and the CLI's default user cannot
   - not the person who triggered the run: ATH acted on their behalf, so they are the author
   - a member of one of the product's owning groups (profile `owners`)
-  - each gate is approved once
+  - each gate is approved once (T3 has two: its test plan, then its proposal)
 Reject: the run must be waiting at that gate, and the decider is a named person who either
 triggered the run or is in an owning group. Stopping is always the safe direction.
 
@@ -39,7 +39,9 @@ def _same_person(a: str, b: str) -> bool:
     return a.strip().casefold() == b.strip().casefold()
 
 
-def approval_problem(m: RunManifest, stage: Stage, user: str, groups: list[str], owners: list[str]) -> str | None:
+def approval_problem(m: RunManifest, stage: Stage, user: str, groups: list[str], owners: list[str],
+                     subject: str | None = None) -> str | None:
+    """`subject` tells apart gates of one stage: T3 approves its test plan, then its proposal."""
     if p := _waiting(m, stage) or _person(user):
         return p
     if _same_person(user, m.context.triggered_by):
@@ -47,8 +49,8 @@ def approval_problem(m: RunManifest, stage: Stage, user: str, groups: list[str],
                 f"another member of {owners} must (separation of duties)")
     if not set(groups) & set(owners):
         return f"{user} is not in an owning group of {m.context.product} ({owners}); groups given: {groups or 'none'}"
-    if any(g.stage == stage and g.decision == "approved" for g in m.gates):
-        return f"gate {stage.value} is already approved"
+    if any(g.stage == stage and g.decision == "approved" and g.subject == subject for g in m.gates):
+        return f"gate {stage.value}{' ' + subject if subject else ''} is already approved"
     return None
 
 

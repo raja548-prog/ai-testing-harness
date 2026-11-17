@@ -7,12 +7,16 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
 import json
+import os
+import shlex
 import shutil
 import subprocess
 import sys
 import uuid
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -22,7 +26,10 @@ from ath_core.agents.cli import (
     AgentError, author_model, build_author_agent, build_triage_agents, diversity_problem, load_skill, model_family,
     model_problem, voter_models,
 )
-from ath_core.authoring.engine import AuthorInputs, AuthoringEngine, load_proposal, save_proposal
+from ath_core.authoring.engine import (
+    PLAN_SKILL, AuthorInputs, AuthoringEngine, DraftedPlan, Workspace, answer_sheet, answers_from,
+    apply_plan_edits, load_answers, load_plan, load_proposal, plan_yaml, render_plan_md, save_plan, save_proposal,
+)
 from ath_core.authoring.formats import glob_match
 from ath_core.authoring.testdata import load_catalogue
 from ath_core.triage.voting import default_quorum
@@ -30,10 +37,14 @@ from ath_core.config import load_config
 from ath_core.context import load_product_skill, read_rh_package
 from ath_core.policy import load_policy
 from ath_core.schemas import ATRFRun, RunContext, RunMode, Stage, TriageCategory, load_profile
-from ath_core.schemas.authoring import Proposal
+from ath_core.schemas.authoring import Clarification, Proposal, TestPlan
 from ath_server.orchestrator import Orchestrator, StateStore
 
 KIND_FOR = {"build": "pipeline", "deploy": "pipeline"}
+DEFAULT_DB = ".ath/state.db"
+# Run artifacts a person reads to review T3 (all masked). Others, e.g. raw/ results, are never printed.
+REVIEW_ARTIFACTS = ("report.md", "author/plan.md", "author/plan.yaml", "author/answers.yaml",
+                    "author/changes.patch", "author/checklist.md")
 
 
 def cmd_validate(a: argparse.Namespace) -> int:
@@ -229,7 +240,7 @@ def _orch(a: argparse.Namespace) -> Orchestrator:
         quarantined = {l.strip() for l in Path(a.quarantine).read_text().splitlines() if l.strip()}
     return Orchestrator(profile, store, package_version=a.package_version, quarantined=quarantined,
                         report_dir=a.report_dir, agents=agents, profile_ref=str(a.profile), quorum=cfg.quorum,
-                        author_factory=lambda: build_author_agent(cfg, profile))
+                        author_factory=lambda skill: build_author_agent(cfg, profile, skill))
 
 
 def _context(a: argparse.Namespace) -> dict[str, str]:
@@ -323,9 +334,61 @@ def cmd_gate(a: argparse.Namespace) -> int:
     return _print_result(m)
 
 
+def _sheet(path: str, key: str) -> tuple[Any, str | None, str]:
+    """(the `key` list, the plan hash the file names, the text) of an answers or plan file."""
+    text = Path(path).read_text(encoding="utf-8")
+    data = yaml.safe_load(text) or {}
+    if not isinstance(data, dict) or not isinstance(data.get(key), list):
+        raise ValueError(f"{path} needs a `{key}:` list")
+    return data[key], data.get("plan_sha256"), text
+
+
+def cmd_answer(a: argparse.Namespace) -> int:
+    """T3 in a run: answer the plan's spec questions, or send an edited plan. Not an approval."""
+    try:
+        orch = _orch(a)
+        groups = [g.strip() for g in (a.groups or "").split(",") if g.strip()]
+        body = orch.store.get_artifact(a.run_id, "author/plan.json")
+        if not body:
+            raise ValueError(f"run {a.run_id} has no T3 plan waiting for answers")
+        plan = TestPlan.model_validate_json(body)
+        answers, plan_text, ref = None, None, a.ref
+        if a.answers and a.plan:
+            raise ValueError("give --answers or --plan, not both")
+        if a.plan:
+            _, named, plan_text = _sheet(a.plan, "items")
+            ref = ref or named
+        elif a.answers:
+            answers, named, _ = _sheet(a.answers, "answers")
+            ref = ref or named
+        elif not a.no_input and sys.stdin.isatty() and sys.stdout.isatty() and plan.spec_questions:
+            _print_plan(plan, Path(f"<run {a.run_id} artifacts>/author"))
+            print("\nType an answer, `a` to accept the assumption, or Enter to skip.")
+            answers = []
+            for q in plan.spec_questions:
+                print(f"\n{q.id} {('[' + q.clause + '] ') if q.clause else ''}{q.question}")
+                if q.assumption:
+                    print(f"  assumption: {q.assumption}")
+                text = _ask("  answer> ").strip()
+                answers.append({"id": q.id, "answer": "accept" if text.lower() == "a" else text})
+            ref = ref or plan.hash  # the plan just shown
+        else:
+            raise ValueError("give --answers FILE (template: artifact author/answers.yaml) or --plan FILE "
+                             "(artifact author/plan.yaml), or run at a terminal to be asked")
+        m = orch.answer(a.run_id, a.user, groups, ref, answers=answers, plan_yaml_text=plan_text)
+    except (*REFUSALS, PermissionError) as e:
+        print(f"refused: {_why(e)}")
+        return 1
+    return _print_result(m)
+
+
 def cmd_report(a: argparse.Namespace) -> int:
-    body = StateStore(a.db).get_artifact(a.run_id, "report.md")
-    print(body or f"no report for {a.run_id}")
+    name = a.artifact or "report.md"
+    if name not in REVIEW_ARTIFACTS:
+        print(f"refused: --artifact is one of {', '.join(REVIEW_ARTIFACTS[1:])}")
+        return 1
+    body = StateStore(a.db).get_artifact(a.run_id, name)
+    print(body or f"no {name} for {a.run_id}")
     return 0 if body else 1
 
 
@@ -366,7 +429,20 @@ def cmd_eval(a: argparse.Namespace) -> int:
 
 
 # `ainxt-ath author` exit codes (2 and 3 are taken by doctor and eval).
-AUTHOR_OK, AUTHOR_REFUSED, AUTHOR_ONLY_QUESTIONS, AUTHOR_ALL_DROPPED = 0, 1, 4, 5
+AUTHOR_OK, AUTHOR_REFUSED, AUTHOR_ONLY_QUESTIONS, AUTHOR_ALL_DROPPED, AUTHOR_PLAN_READY = 0, 1, 4, 5, 6
+INPUT_KEYS = ("tsd", "rh_package", "from_run", "diff", "code", "section")
+
+_ask = input  # the interactive prompt; tests replace it
+
+
+def _interactive(a: argparse.Namespace) -> bool:
+    return not a.no_input and sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _edit_file(path: Path) -> None:
+    """Open a file in the tester's editor ($VISUAL, $EDITOR, else vi) and wait for it to close."""
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    subprocess.run([*shlex.split(editor), str(path)], check=False)
 
 
 def _git_dirty(root: Path, paths: list[str]) -> list[str] | None:
@@ -407,10 +483,11 @@ def _from_run(store: StateStore, run_id: str, product: str) -> tuple[str, str, l
 
 def _print_proposal(p: Proposal, folder: Path) -> None:
     print(f"proposal {p.id}: {len(p.changes)} change(s), {len(p.dropped)} dropped, "
-          f"{len(p.spec_questions)} spec question(s)")
+          f"{len(p.spec_questions)} spec question(s)" + (f", from plan {p.plan_id}" if p.plan_id else ""))
     print(f"  hash {p.hash}")
     for c in p.changes:
-        print(f"  {c.action:<6} {c.path}  [{', '.join(c.clauses)}]")
+        items = f" {', '.join(c.plan_items)}" if c.plan_items else ""
+        print(f"  {c.action:<6} {c.path}  [{', '.join(c.clauses)}]{items}")
         for flag in c.flags:
             print(f"         review: {flag}")
     for d in p.dropped:
@@ -420,6 +497,30 @@ def _print_proposal(p: Proposal, folder: Path) -> None:
     if p.summary:
         print(f"  summary: {' '.join(p.summary.split())}")
     print(f"  review: {folder / 'changes.patch'} and {folder / 'checklist.md'}")
+
+
+def _print_plan(p: TestPlan, folder: Path) -> None:
+    print(f"plan {p.id}: {len(p.items)} item(s), {len(p.dropped)} dropped, {len(p.spec_questions)} open "
+          f"spec question(s), {len(p.clarifications)} clarification(s), round {p.round}")
+    print(f"  hash {p.hash}")
+    for i in p.items:
+        who = "  (added by tester)" if i.origin == "tester" else "  (edited by tester)" if i.edited else ""
+        print(f"  {i.id:<5} {i.action:<6} {i.path}  [{', '.join(i.clauses)}]{who}")
+        print(f"         {' '.join(i.scenario.split())}")
+        if i.expected:
+            print(f"         expect: {' '.join(i.expected.split())}")
+        if i.clarifications:
+            print(f"         relies on: {', '.join(i.clarifications)}")
+    for d in p.dropped:
+        print(f"  DROPPED {d.path}: {d.reason}")
+    for q in p.spec_questions:
+        print(f"  QUESTION {q.id} {('[' + q.clause + '] ') if q.clause else ''}{q.question}")
+        if q.assumption:
+            print(f"           assumption: {' '.join(q.assumption.split())}")
+    if p.summary:
+        print(f"  summary: {' '.join(p.summary.split())}")
+    print(f"  review: {folder / 'plan.md'}; edit {folder / 'plan.yaml'}"
+          + (f"; answer in {folder / 'answers.yaml'}" if p.spec_questions else ""))
 
 
 def _author_apply(profile, p: Proposal, tests: Path, force: bool, user: str, store: StateStore) -> int:
@@ -450,9 +551,217 @@ def _author_apply(profile, p: Proposal, tests: Path, force: bool, user: str, sto
     return AUTHOR_OK
 
 
+class _Author:
+    """One `ainxt-ath author` invocation: plan rounds, then generation, against one test checkout."""
+
+    def __init__(self, a: argparse.Namespace, profile, tests: Path, out_root: Path, store: StateStore):
+        self.a, self.profile, self.tests, self.out_root, self.store = a, profile, tests, out_root, store
+        self._cfg = None
+
+    @property
+    def cfg(self):
+        if self._cfg is None:
+            self._cfg = load_config(self.a.config)
+        return self._cfg
+
+    def cmd(self, action: str, ref: str) -> str:
+        """The command line for the next step, with this invocation's profile and checkout."""
+        return (f"ainxt-ath author {action} {ref} --profile {self.a.profile} --tests {self.a.tests}"
+                + (f" --out {self.a.out}" if self.a.out else "") + (f" --db {self.a.db}" if self.a.db != DEFAULT_DB else ""))
+
+    # ------------------------------------------------------------------ inputs
+    def spec_from_args(self) -> dict[str, Any]:
+        """The inputs of this invocation, as absolute paths, to store with each plan."""
+        def absolute(v: str | None) -> str | None:
+            return str(Path(v).expanduser().resolve()) if v else None
+        return {"tsd": absolute(self.a.tsd), "rh_package": absolute(self.a.rh_package), "from_run": self.a.from_run,
+                "diff": absolute(self.a.diff), "code": absolute(self.a.code), "section": self.a.section or []}
+
+    def spec_for(self, folder: Path) -> dict[str, Any]:
+        """A plan's stored inputs; inputs given on this command line win."""
+        path = folder / "inputs.json"
+        stored = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        given = self.spec_from_args()
+        spec = {k: (given[k] or stored.get(k)) for k in INPUT_KEYS}
+        spec["tsd_sha256"] = stored.get("tsd_sha256", "")
+        return spec
+
+    def read(self, spec: dict[str, Any]) -> AuthorInputs:
+        tsd, diff, outdated = "", "", []
+        if spec.get("from_run"):
+            tsd, diff, outdated = _from_run(self.store, spec["from_run"], self.profile.product)
+        if spec.get("tsd") or spec.get("rh_package"):
+            parts = [Path(spec["tsd"]).read_text(encoding="utf-8")] if spec.get("tsd") else []
+            if spec.get("rh_package"):
+                parts.append(read_rh_package(spec["rh_package"]))
+            tsd = "\n\n".join(parts)
+        if spec.get("diff"):
+            diff = Path(spec["diff"]).read_text(encoding="utf-8")
+        if not tsd.strip():
+            raise ValueError("no TSD: give --tsd, --rh-package, or --from-run with a run that has one")
+        sha = hashlib.sha256(tsd.encode("utf-8")).hexdigest()
+        if spec.get("tsd_sha256") and spec["tsd_sha256"] != sha:
+            print("note: the TSD changed since the plan was made; planning with the TSD as it is now")
+        spec["tsd_sha256"] = sha
+        return AuthorInputs(tsd=tsd, tests_dir=self.tests, sections=spec.get("section") or [],
+                            code_dir=Path(spec["code"]) if spec.get("code") else None, diff=diff or None,
+                            outdated=outdated or None)
+
+    def check_checkout(self) -> None:
+        if not self.a.dry_run and not self.a.force and _git_dirty(self.tests, []) is None:
+            raise ValueError(f"{self.tests} is not a Git repository, so uncommitted changes cannot be checked; "
+                             f"pass --force to write anyway, or --dry-run to only propose")
+
+    # ------------------------------------------------------------------ plan
+    def save(self, drafted: DraftedPlan, spec: dict[str, Any]) -> Path:
+        p = drafted.plan
+        folder = self.out_root / p.id
+        save_plan(folder, drafted, (self.cmd("generate", p.id), self.cmd("answer", p.id)))
+        (folder / "inputs.json").write_text(json.dumps({k: spec.get(k) for k in (*INPUT_KEYS, "tsd_sha256")},
+                                                       indent=2), encoding="utf-8")
+        return folder
+
+    def plan_round(self, spec: dict[str, Any], parent: TestPlan | None = None,
+                   clarifications: list[Clarification] | None = None) -> tuple[TestPlan, Path]:
+        """One model call to t03-plan. Raises REFUSALS or AgentError."""
+        pid = f"plan-{uuid.uuid4().hex[:10]}"
+        inputs = self.read(spec)
+        inputs.clarifications = clarifications or None
+        agent = build_author_agent(self.cfg, self.profile, PLAN_SKILL)
+        try:
+            drafted = AuthoringEngine(self.profile, planner=agent).plan(inputs, "standalone", pid, parent)
+        finally:
+            if agent.last_call:
+                self.store.event(pid, "T3", "agent.call", agent="cli-planner", **agent.last_call)
+        p = drafted.plan
+        folder = self.save(drafted, spec)
+        self.store.event(p.id, "T3", "author.planned", plan=p.hash, parent=p.parent, round=p.round,
+                         items=len(p.items), dropped=len(p.dropped), spec_questions=len(p.spec_questions),
+                         clarifications=len(p.clarifications))
+        return p, folder
+
+    def answer_round(self, plan: TestPlan, new: list[Clarification], spec: dict[str, Any]) -> tuple[TestPlan, Path]:
+        limit = self.profile.test_authoring.limits.max_rounds
+        if plan.round >= limit:
+            raise ValueError(f"plan {plan.id} is round {plan.round}, the limit (testAuthoring.limits.maxRounds "
+                             f"{limit}); generate from it, edit plan.yaml, or update the TSD")
+        self.store.event(plan.id, "T3", "author.answered", plan=plan.hash, by=self.a.user,
+                         answered=[c.id for c in new])
+        print(f"planning again with {len(new)} answer(s)")
+        return self.plan_round(spec, parent=plan, clarifications=[*plan.clarifications, *new])
+
+    def prompt_answers(self, plan: TestPlan, folder: Path) -> list[Clarification]:
+        print(f"\n{len(plan.spec_questions)} spec question(s). Type an answer, `a` to accept the assumption, "
+              f"or Enter to skip.")
+        typed: dict[str, str] = {}
+        for q in plan.spec_questions:
+            print(f"\n{q.id} {('[' + q.clause + '] ') if q.clause else ''}{q.question}")
+            if q.assumption:
+                print(f"  assumption: {q.assumption}")
+            text = _ask("  answer> ").strip()
+            typed[q.id] = "accept" if text.lower() == "a" else text
+        ws = Workspace(self.profile, self.tests)
+        new = answers_from([{"id": k, "answer": v} for k, v in typed.items()], plan, self.a.user, ws.masker.mask)
+        # The record of what was typed, masked like everything else stored.
+        (folder / "answers.yaml").write_text(answer_sheet(plan, self.cmd("answer", plan.id),
+                                                          {c.id: c.answer for c in new}), encoding="utf-8")
+        return new
+
+    def edit_plan(self, plan: TestPlan, folder: Path, text: str) -> tuple[TestPlan, Path]:
+        """A new plan version from tester edits (no model call); the same plan when nothing changed."""
+        edited = apply_plan_edits(plan, text, Workspace(self.profile, self.tests), self.a.user,
+                                  new_id=f"plan-{uuid.uuid4().hex[:10]}")
+        if edited is None:
+            return plan, folder
+        spec = self.spec_for(folder)
+        new_folder = self.save(DraftedPlan(edited, render_plan_md(edited)), spec)
+        self.store.event(edited.id, "T3", "author.plan_edited", plan=edited.hash, parent=plan.id, by=self.a.user,
+                         items=[i.id for i in edited.items if i.edited or i.origin == "tester"])
+        print(f"plan edited: new version {edited.id}")
+        return edited, new_folder
+
+    def review(self, plan: TestPlan, folder: Path, spec: dict[str, Any]) -> int:
+        """Show the plan; answer, edit and approve it at a terminal, or say what to do next."""
+        while True:
+            _print_plan(plan, folder)
+            interactive = _interactive(self.a)
+            if plan.spec_questions and interactive and plan.round < self.profile.test_authoring.limits.max_rounds:
+                new = self.prompt_answers(plan, folder)
+                if new:
+                    plan, folder = self.answer_round(plan, new, spec)
+                    continue
+            if plan.spec_questions and not interactive:
+                print(f"open spec questions: answer them in {folder / 'answers.yaml'}, then run:\n"
+                      f"  {self.cmd('answer', plan.id)}\n"
+                      f"or generate from the plan as it is: {self.cmd('generate', plan.id)}")
+                return AUTHOR_ONLY_QUESTIONS
+            if not plan.items:
+                print("the plan has no items; nothing to generate" +
+                      (" (answer the spec questions, or update the TSD)" if plan.spec_questions else ""))
+                return AUTHOR_ONLY_QUESTIONS
+            if self.a.yes:
+                return self.generate(plan, folder, spec)
+            if not interactive:
+                print(f"plan ready for review: read {folder / 'plan.md'}, edit {folder / 'plan.yaml'} if needed, "
+                      f"then run:\n  {self.cmd('generate', plan.id)}")
+                return AUTHOR_PLAN_READY
+            choice = _ask(f"\nGenerate tests for {len(plan.items)} plan item(s)? [Y]es / [n]o / [e]dit plan.yaml: ")
+            choice = choice.strip().lower()[:1]
+            if choice == "n":
+                print(f"stopped; generate later with: {self.cmd('generate', plan.id)}")
+                return AUTHOR_PLAN_READY
+            if choice == "e":
+                _edit_file(folder / "plan.yaml")
+                try:
+                    plan, folder = self.edit_plan(plan, folder, (folder / "plan.yaml").read_text(encoding="utf-8"))
+                except ValueError as e:
+                    print(f"plan.yaml not used: {e}")
+                    (folder / "plan.yaml").write_text(plan_yaml(plan, self.cmd("generate", plan.id)), encoding="utf-8")
+                continue
+            return self.generate(plan, folder, spec)
+
+    # ------------------------------------------------------------------ generate
+    def generate(self, plan: TestPlan, folder: Path, spec: dict[str, Any]) -> int:
+        if not plan.items:
+            print(f"plan {plan.id} has no items; nothing to generate")
+            return AUTHOR_ONLY_QUESTIONS
+        self.check_checkout()
+        self.store.event(plan.id, "T3", "author.plan_approved", plan=plan.hash, by=self.a.user)
+        pid = f"author-{uuid.uuid4().hex[:10]}"
+        agent = None
+        try:
+            inputs = self.read(spec)
+            inputs.clarifications, inputs.plan = plan.clarifications or None, plan
+            agent = build_author_agent(self.cfg, self.profile)
+            drafted = AuthoringEngine(self.profile, agent).propose(inputs, source="standalone", proposal_id=pid)
+        finally:
+            if agent is not None and agent.last_call:
+                self.store.event(pid, "T3", "agent.call", agent="cli-author", **agent.last_call)
+        return self.finish(drafted, pid)
+
+    def finish(self, drafted, pid: str) -> int:
+        folder = self.out_root / pid
+        h = save_proposal(folder, drafted)
+        p = drafted.proposal
+        self.store.event(pid, "T3", "author.proposed", proposal=h, plan=p.plan_sha256 or None, changes=len(p.changes),
+                         dropped=len(p.dropped), spec_questions=len(p.spec_questions), dry_run=self.a.dry_run)
+        _print_proposal(p, folder)
+        if not p.changes:
+            if p.proposed_count == 0:
+                print("no changes proposed" + (": see the spec questions" if p.spec_questions else ""))
+                return AUTHOR_ONLY_QUESTIONS
+            print("every proposed change was dropped by a guard; nothing to apply")
+            return AUTHOR_ALL_DROPPED
+        if self.a.dry_run:
+            print(f"dry run: nothing written; apply after review with: {self.cmd('apply', pid)}")
+            return AUTHOR_OK
+        return _author_apply(self.profile, p, self.tests, self.a.force, self.a.user, self.store)
+
+
 def cmd_author(a: argparse.Namespace) -> int:
-    """Create or update tests from a TSD in a local checkout, without a run. `author apply <id>` applies a
-    stored proposal (e.g. a --dry-run one) without a model call."""
+    """Plan tests from a TSD, answer its spec questions, then generate and apply them in a local checkout,
+    without a run. `answer <plan>` plans again with answers, `generate <plan>` writes the tests of an
+    (edited) plan, `apply <proposal>` applies a stored proposal without a model call."""
     out_root = Path(a.out or ".ath/authoring")
     store = StateStore(a.db)
     if a.action is None and a.proposal_id:
@@ -468,71 +777,49 @@ def cmd_author(a: argparse.Namespace) -> int:
         tests = Path(a.tests).expanduser()
         if not tests.is_dir():
             raise ValueError(f"--tests {a.tests} is not a folder")
+        if a.action and not a.proposal_id:
+            what = "proposal" if a.action == "apply" else "plan"
+            raise ValueError(f"give the {what} id: ainxt-ath author {a.action} <id>")
     except REFUSALS as e:
         print(f"refused: {_why(e)}")
         return AUTHOR_REFUSED
-    if a.action == "apply":
-        if not a.proposal_id:
-            print("refused: give the proposal id: ainxt-ath author apply <id>")
-            return AUTHOR_REFUSED
-        folder = out_root / a.proposal_id
-        try:
-            p = load_proposal(folder)
-        except (OSError, ValueError) as e:
-            print(f"refused: {_why(e)}")
-            return AUTHOR_REFUSED
-        if p.product != profile.product:
-            print(f"refused: proposal {p.id} is for {p.product!r}, not {profile.product!r}")
-            return AUTHOR_REFUSED
-        print(f"applying proposal {p.id} (hash {p.hash}), no model call")
-        return _author_apply(profile, p, tests, a.force, a.user, store)
-
-    agent = None
-    pid = f"author-{uuid.uuid4().hex[:10]}"
+    run = _Author(a, profile, tests, out_root, store)
     try:
-        if not a.dry_run and not a.force and _git_dirty(tests, []) is None:
-            raise ValueError(f"{tests} is not a Git repository, so uncommitted changes cannot be checked; "
-                             f"pass --force to write anyway, or --dry-run to only propose")
-        tsd, diff, outdated = "", "", []
-        if a.from_run:
-            tsd, diff, outdated = _from_run(store, a.from_run, profile.product)
-        if a.tsd or a.rh_package:
-            parts = [Path(a.tsd).read_text(encoding="utf-8")] if a.tsd else []
-            if a.rh_package:
-                parts.append(read_rh_package(a.rh_package))
-            tsd = "\n\n".join(parts)
-        if a.diff:
-            diff = Path(a.diff).read_text(encoding="utf-8")
-        if not tsd.strip():
-            raise ValueError("no TSD: give --tsd, --rh-package, or --from-run with a run that has one")
-        agent = build_author_agent(load_config(a.config), profile)
-        inputs = AuthorInputs(tsd=tsd, tests_dir=tests, sections=a.section or [],
-                              code_dir=Path(a.code).expanduser() if a.code else None, diff=diff or None,
-                              outdated=outdated or None)
-        drafted = AuthoringEngine(profile, agent).propose(inputs, source="standalone", proposal_id=pid)
+        if a.action == "apply":
+            p = load_proposal(out_root / a.proposal_id)
+            if p.product != profile.product:
+                raise ValueError(f"proposal {p.id} is for {p.product!r}, not {profile.product!r}")
+            print(f"applying proposal {p.id} (hash {p.hash}), no model call")
+            return _author_apply(profile, p, tests, a.force, a.user, store)
+        if a.action in ("answer", "generate"):
+            folder = out_root / a.proposal_id
+            plan = load_plan(folder)
+            if plan.product != profile.product:
+                raise ValueError(f"plan {plan.id} is for {plan.product!r}, not {profile.product!r}")
+            spec = run.spec_for(folder)
+            if a.action == "answer":
+                sheet = Path(a.answers) if a.answers else folder / "answers.yaml"
+                if not plan.spec_questions:
+                    raise ValueError(f"plan {plan.id} has no open spec questions; generate from it")
+                new = load_answers(sheet.read_text(encoding="utf-8"), plan, a.user,
+                                   Workspace(profile, tests).masker.mask)
+                if not new:
+                    raise ValueError(f"no answers in {sheet}: write `answer:` for at least one question")
+                plan, folder = run.answer_round(plan, new, spec)
+                return run.review(plan, folder, spec)
+            plan_file = Path(a.plan) if a.plan else folder / "plan.yaml"
+            if plan_file.exists():
+                plan, folder = run.edit_plan(plan, folder, plan_file.read_text(encoding="utf-8"))
+            print(f"generating tests for plan {plan.id} ({len(plan.items)} item(s), hash {plan.hash})")
+            return run.generate(plan, folder, spec)
+        # a new plan
+        run.check_checkout()
+        spec = run.spec_from_args()
+        plan, folder = run.plan_round(spec)
+        return run.review(plan, folder, spec)
     except (*REFUSALS, AgentError) as e:
         print(f"refused: {_why(e)}")
         return AUTHOR_REFUSED
-    finally:
-        if agent is not None and agent.last_call:
-            store.event(pid, "T3", "agent.call", agent="cli-author", **agent.last_call)
-    folder = out_root / pid
-    h = save_proposal(folder, drafted)
-    p = drafted.proposal
-    store.event(pid, "T3", "author.proposed", proposal=h, changes=len(p.changes), dropped=len(p.dropped),
-                spec_questions=len(p.spec_questions), dry_run=a.dry_run)
-    _print_proposal(p, folder)
-    if not p.changes:
-        if p.proposed_count == 0:
-            print("no changes proposed" + (": answer the spec questions, then run again" if p.spec_questions else ""))
-            return AUTHOR_ONLY_QUESTIONS
-        print("every proposed change was dropped by a guard; nothing to apply")
-        return AUTHOR_ALL_DROPPED
-    if a.dry_run:
-        print(f"dry run: nothing written; apply after review with: ainxt-ath author apply {pid} "
-              f"--profile {a.profile} --tests {a.tests}")
-        return AUTHOR_OK
-    return _author_apply(profile, p, tests, a.force, a.user, store)
 
 
 def cmd_events(a: argparse.Namespace) -> int:
@@ -602,10 +889,19 @@ def build_parser() -> argparse.ArgumentParser:
             g.add_argument("--ref", help="T3: the proposal hash you reviewed; refused if the stored proposal differs")
         g.set_defaults(fn=cmd_gate, decision=decision, ref=None)
 
-    au = sub.add_parser("author", help="create or update tests from a TSD in a local checkout "
-                                       "(exit 4: only spec questions, 5: every change dropped)")
-    au.add_argument("action", nargs="?", choices=["apply"], help="apply: apply a stored proposal, no model call")
-    au.add_argument("proposal_id", nargs="?", help="with apply: the proposal id (author-...)")
+    au = sub.add_parser("author", help="plan, then create or update tests from a TSD in a local checkout "
+                                       "(exit 4: open spec questions, 5: every change dropped, "
+                                       "6: plan waiting for review)")
+    au.add_argument("action", nargs="?", choices=["answer", "generate", "apply"],
+                    help="answer: plan again with answers.yaml; generate: write the tests of a plan "
+                         "(after plan.yaml edits); apply: apply a stored proposal, no model call")
+    au.add_argument("proposal_id", nargs="?", metavar="id",
+                    help="with answer/generate: the plan id (plan-...); with apply: the proposal id (author-...)")
+    au.add_argument("--answers", help="with answer: the answers file (default <out>/<plan>/answers.yaml)")
+    au.add_argument("--plan", help="with generate: the edited plan (default <out>/<plan>/plan.yaml)")
+    au.add_argument("--yes", action="store_true",
+                    help="approve a plan with no open questions and generate right away (one step, for scripts)")
+    au.add_argument("--no-input", action="store_true", help="never prompt, even at a terminal")
     au.add_argument("--profile", required=True)
     au.add_argument("--tests", required=True, help="the local test checkout")
     au.add_argument("--tsd", help="TSD markdown")
@@ -619,10 +915,24 @@ def build_parser() -> argparse.ArgumentParser:
     au.add_argument("--force", action="store_true",
                     help="write even if target files have uncommitted changes or the checkout is not a Git repo")
     au.add_argument("--out", help="folder for proposals (default .ath/authoring); each goes in <out>/<id>/")
-    au.add_argument("--db", default=".ath/state.db")
-    au.add_argument("--user", default=getpass.getuser(), help="recorded as who applied the changes")
+    au.add_argument("--db", default=DEFAULT_DB)
+    au.add_argument("--user", default=getpass.getuser(), help="recorded as who answered, approved and applied")
     au.add_argument("--config", help="harness config (default: $ATH_CONFIG, .ath/config.yaml, ~/.config/ainxt/ath.yaml)")
     au.set_defaults(fn=cmd_author)
+
+    an = sub.add_parser("answer", help="T3 in a run: answer the plan's spec questions (T3 plans again) or "
+                                       "send an edited plan; the run parks at the plan gate again")
+    common(an)
+    an.add_argument("run_id")
+    an.add_argument("--user", required=True, help="who answers (SSO user id in the platform)")
+    an.add_argument("--groups", help="comma-separated groups of that user (SSO groups in the platform)")
+    an.add_argument("--answers", help="answers file (`ainxt-ath answer` writes the template, artifact "
+                                      "author/answers.yaml); without it, prompts at a terminal")
+    an.add_argument("--plan", help="an edited plan.yaml (artifact author/plan.yaml), instead of answers")
+    an.add_argument("--ref", help="the plan hash you read; refused if the stored plan differs "
+                                  "(default: the stored plan, when answering at the prompt)")
+    an.add_argument("--no-input", action="store_true", help="never prompt")
+    an.set_defaults(fn=cmd_answer)
 
     rs = sub.add_parser("resume", help="resume a run from its last checkpoint")
     common(rs)
@@ -634,6 +944,7 @@ def build_parser() -> argparse.ArgumentParser:
     rp = sub.add_parser("report", help="print a run's report")
     rp.add_argument("run_id")
     rp.add_argument("--db", default=".ath/state.db")
+    rp.add_argument("--artifact", help="print a T3 review artifact instead: " + ", ".join(REVIEW_ARTIFACTS[1:]))
     rp.set_defaults(fn=cmd_report)
 
     e = sub.add_parser("eval", help="score triage voters on a labelled dataset (exit 3 if a gate fails)")

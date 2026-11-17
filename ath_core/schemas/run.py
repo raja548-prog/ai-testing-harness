@@ -90,7 +90,8 @@ class GateDecision(BaseModel):
     by: str
     groups: list[str] = Field(default_factory=list)
     comment: str = ""
-    ref: str | None = None  # hash of what was approved (T3: the proposal hash)
+    ref: str | None = None  # hash of what was approved (T3: the plan hash, then the proposal hash)
+    subject: str | None = None  # T3: "plan" or "proposal" (T3 has two gates); None for the other gates
     at: datetime = Field(default_factory=utcnow)
 
 

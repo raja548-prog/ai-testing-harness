@@ -417,8 +417,8 @@ def build_triage_agents(cfg: HarnessConfig, profile: TestProfile) -> list[CliTri
 
 
 class CliAuthorAgent:
-    """The T3 author: one CLI session running skills/t03-author. A single author, not voters: a human
-    reviews what it proposes. The engine masks every block before it gets here."""
+    """The T3 author: one CLI session running skills/t03-plan or skills/t03-author. A single author, not
+    voters: a human reviews what it proposes. The engine masks every block before it gets here."""
 
     def __init__(self, runner: CliAgentRunner, skill: Skill, model: str):
         self.runner, self.skill, self.model = runner, skill, model
@@ -435,9 +435,10 @@ def author_model(profile: TestProfile) -> str:
     return profile.models.for_stage("author") if profile.models else ""
 
 
-def build_author_agent(cfg: HarnessConfig, profile: TestProfile) -> CliAuthorAgent:
-    """The T3 author from the harness config. Raises ValueError, before any call, when no agent runner is
-    configured, the author model breaks the model policy, or the CLI would pick its own model."""
+def build_author_agent(cfg: HarnessConfig, profile: TestProfile, skill_name: str = "t03-author") -> CliAuthorAgent:
+    """The T3 author from the harness config, running `skill_name` (t03-plan plans, t03-author writes
+    the tests). Raises ValueError, before any call, when no agent runner is configured, the author
+    model breaks the model policy, or the CLI would pick its own model."""
     rc = cfg.agent_runner
     if rc is None:
         raise ValueError("no agent runner configured for LLM stages; set agentRunner in the harness config "
@@ -447,7 +448,7 @@ def build_author_agent(cfg: HarnessConfig, profile: TestProfile) -> CliAuthorAge
         raise ValueError(problem)
     if problem := model_problem(cfg):
         raise ValueError(problem)
-    skill = load_skill(cfg.skills_dir / "t03-author" / "SKILL.md")
+    skill = load_skill(cfg.skills_dir / skill_name / "SKILL.md")
     if not skill.output_schema:
-        raise ValueError(f"{cfg.skills_dir / 't03-author' / 'SKILL.md'} has no output_schema")
+        raise ValueError(f"{cfg.skills_dir / skill_name / 'SKILL.md'} has no output_schema")
     return CliAuthorAgent(CliAgentRunner(rc), skill, model)

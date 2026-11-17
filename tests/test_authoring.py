@@ -1,8 +1,10 @@
 """T3 test authoring: engine, guards, masking, formats, standalone `author` command and T3 in a run."""
 from __future__ import annotations
 
+import hashlib
 import json
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -14,7 +16,8 @@ import yaml
 from ath_cli.main import main
 from ath_core.adapters import AdapterError, registry
 from ath_core.authoring.engine import (
-    PLACEHOLDER, AuthorInputs, AuthoringEngine, Workspace, load_proposal, module_globs, save_proposal,
+    PLACEHOLDER, AuthorInputs, AuthoringEngine, Workspace, answers_from, apply_plan_edits, load_plan, load_proposal,
+    module_globs, save_proposal,
 )
 from ath_core.authoring.formats import TextFile, glob_match
 from ath_core.authoring.signatures import generic_signatures, java_signatures, signatures
@@ -24,7 +27,7 @@ from ath_core.masking import Masker
 from ath_core.policy import load_policy
 from ath_core.schemas import RunContext, RunMode, RunStatus, Stage, StageStatus, load_profile
 from ath_core.schemas.atrf import ATRFCase, ATRFFailure, ATRFRun, CaseStatus, Triage, TriageCategory
-from ath_core.schemas.authoring import Proposal
+from ath_core.schemas.authoring import Proposal, TestPlan
 from ath_server.orchestrator import Orchestrator, StateStore
 from tests.conftest import LOCAL_PROFILE, PROD_PROFILE, ROOT
 
@@ -48,15 +51,34 @@ CREATE = {"action": "create", "path": NEW_TEST, "clauses": ["AC-8", "R-4"], "rea
                      "    @Test\n    void refundReversesFee() {\n        assertEquals(1, 1);\n    }\n}\n"}
 
 
+# The same changes, implementing the items of PLAN (TP-1 updates JAVA_TEST, TP-2 creates NEW_TEST).
+UPDATE_P = {**UPDATE, "plan_items": ["TP-1"]}
+CREATE_P = {**CREATE, "plan_items": ["TP-2"]}
+PLAN_UPDATE = {"action": "update", "path": JAVA_TEST, "clauses": ["AC-7"],
+               "scenario": "a fee of 1250.00 is rounded half-up", "expected": "15.63"}
+PLAN_CREATE = {"action": "create", "path": NEW_TEST, "clauses": ["AC-8", "R-4"],
+               "scenario": "a refund reverses the fee", "expected": "the original fee, in full"}
+QUESTION = {"clause": "AC-8", "question": "do partial refunds reverse a share of the fee?",
+            "assumption": "a partial refund reverses the same share of the fee"}
+
+
 def answer(*changes, questions=(), summary="done") -> dict:
     return {"changes": list(changes), "spec_questions": list(questions), "summary": summary}
 
 
+def plan_answer(*items, questions=(), summary="planned") -> dict:
+    return {"plan": list(items), "spec_questions": list(questions), "summary": summary}
+
+
+PLAN = plan_answer(PLAN_UPDATE, PLAN_CREATE)
+
+
 class StubAgent:
-    """In-process author: returns a fixed answer and records the blocks it was sent."""
+    """In-process author: returns a fixed answer (or, given a list, one per call, the last repeating)
+    and records the blocks it was sent."""
     model = "local/onprem-coder"
 
-    def __init__(self, out: dict):
+    def __init__(self, out):
         self.out, self.calls, self.blocks = out, 0, {}
         self.last_call: dict = {}
 
@@ -64,7 +86,7 @@ class StubAgent:
         self.calls += 1
         self.blocks = blocks
         self.last_call = {"model": self.model, "prompt_sha256": "p" * 64}
-        return self.out
+        return self.out[min(self.calls, len(self.out)) - 1] if isinstance(self.out, list) else self.out
 
 
 def git(path: Path, *args: str) -> None:
@@ -436,10 +458,10 @@ def test_prompt_blocks_and_placeholders(profile, checkout):
     _, agent = propose(profile, checkout, answer(UPDATE))
     b = agent.blocks
     assert list(b) == ["tsd", "tests", "tree", "conventions", "testdata", "product", "code", "templates", "diff",
-                       "impact", "outdated"]
+                       "impact", "outdated", "clarifications", "plan"]
     assert "ⓘ R-3 · AC-7" in b["tsd"] and "SettleNxt test conventions" in b["conventions"]
     assert "SettleNxt product skill" in b["product"] and "refund-template.yaml" in b["templates"]
-    assert b["code"] == b["diff"] == b["impact"] == b["outdated"] == PLACEHOLDER
+    assert b["code"] == b["diff"] == b["impact"] == b["outdated"] == b["clarifications"] == b["plan"] == PLACEHOLDER
     assert "visa-credit-01 (card)" in b["testdata"] and "fields: cvv, expiry, pan" in b["testdata"]
     for value in ("4111111111111111", "5500005555555559", "9876543210", "234567890124", "123"):
         assert value not in b["testdata"]  # catalogue values never reach the model
@@ -549,18 +571,24 @@ def fake(tmp_path, monkeypatch):
     cfg.write_text(yaml.safe_dump({"agentRunner": {
         "command": [sys.executable, str(FAKE), "--prompt-file", "{prompt_file}", "-m", "{model}"],
         "promptVia": "file", "voters": 1,
-        "passEnv": ["FAKE_AGENT_MODE", "FAKE_AUTHOR_OUTPUT", "FAKE_AGENT_RECORD"]}}))
+        "passEnv": ["FAKE_AGENT_MODE", "FAKE_AUTHOR_OUTPUT", "FAKE_PLAN_OUTPUT", "FAKE_AGENT_RECORD"]}}))
     monkeypatch.setenv("ATH_CONFIG", str(cfg))
     monkeypatch.setenv("FAKE_AGENT_MODE", "author")
     monkeypatch.setenv("FAKE_AGENT_RECORD", str(tmp_path / "calls"))
-    out = tmp_path / "answer.json"
+    out, plan_out = tmp_path / "answer.json", tmp_path / "plan.json"
     monkeypatch.setenv("FAKE_AUTHOR_OUTPUT", str(out))
+    monkeypatch.setenv("FAKE_PLAN_OUTPUT", str(plan_out))
+    plan_out.write_text(json.dumps(PLAN))
 
     class Fake:
         config = cfg
 
         def answer(self, obj):
             out.write_text(json.dumps(obj))
+
+        def plan(self, obj):
+            """The planner's answer; a list gives one per call."""
+            plan_out.write_text(json.dumps(obj))
 
         def calls(self) -> int:
             return len(list((tmp_path / "calls").glob("call-*.txt"))) if (tmp_path / "calls").exists() else 0
@@ -576,35 +604,46 @@ def author_cli(tmp_path, checkout, *extra):
 
 
 def _proposal_id(out: str) -> str:
-    return out.split("proposal ", 1)[1].split(":", 1)[0]
+    return "author-" + out.split("proposal author-", 1)[1].split(":", 1)[0]
+
+
+def _plan_id(out: str) -> str:
+    """The last plan printed."""
+    return "plan-" + ("\n" + out).rsplit("\nplan plan-", 1)[1].split(":", 1)[0]
 
 
 def test_cli_author_writes_into_the_checkout(fake, tmp_path, checkout, capsys):
-    fake.answer(answer(UPDATE, CREATE))
-    assert author_cli(tmp_path, checkout, "--tsd", str(TSD_FILE)) == 0
+    fake.answer(answer(UPDATE_P, CREATE_P))
+    assert author_cli(tmp_path, checkout, "--tsd", str(TSD_FILE), "--yes") == 0
     out = capsys.readouterr().out
     assert f"wrote {JAVA_TEST}" in out and (checkout / NEW_TEST).exists()
-    pid = _proposal_id(out)
+    pid, plan_id = _proposal_id(out), _plan_id(out)
     folder = tmp_path / "proposals" / pid
     assert {f.name for f in folder.iterdir()} == {"proposal.json", "proposal.sha256", "changes.patch", "checklist.md"}
-    kinds = [k for _, k, _ in StateStore(tmp_path / "state.db").events(pid)]
-    assert kinds == ["agent.call", "author.proposed", "author.applied"]
-    assert "[PAN****1111]" in fake.prompt() and "4111 1111 1111 1111" not in fake.prompt()
+    assert {f.name for f in (tmp_path / "proposals" / plan_id).iterdir()} == {
+        "plan.json", "plan.sha256", "plan.md", "plan.yaml", "inputs.json"}
+    db = StateStore(tmp_path / "state.db")
+    assert [k for _, k, _ in db.events(pid)] == ["agent.call", "author.proposed", "author.applied"]
+    assert [k for _, k, _ in db.events(plan_id)] == ["agent.call", "author.planned", "author.plan_approved"]
+    assert load_proposal(folder).plan_id == plan_id
+    for n in (1, 2):  # the plan call, then the generate call
+        assert "[PAN****1111]" in fake.prompt(n) and "4111 1111 1111 1111" not in fake.prompt(n)
+    assert "# T3 test plan" in fake.prompt(1) and "TP-1 [AC-7] update" in fake.prompt(2)
 
 
 def test_cli_dry_run_then_apply_without_a_model_call(fake, tmp_path, checkout, capsys):
-    fake.answer(answer(UPDATE))
+    fake.answer(answer(UPDATE_P))
     before = (checkout / JAVA_TEST).read_text()
-    assert author_cli(tmp_path, checkout, "--tsd", str(TSD_FILE), "--dry-run") == 0
+    assert author_cli(tmp_path, checkout, "--tsd", str(TSD_FILE), "--dry-run", "--yes") == 0
     assert (checkout / JAVA_TEST).read_text() == before
     pid = _proposal_id(capsys.readouterr().out)
     assert author_cli(tmp_path, checkout, "apply", pid) == 0
-    assert "15.63" in (checkout / JAVA_TEST).read_text() and fake.calls() == 1
+    assert "15.63" in (checkout / JAVA_TEST).read_text() and fake.calls() == 2
 
 
 def test_cli_apply_refuses_a_tampered_proposal(fake, tmp_path, checkout, capsys):
-    fake.answer(answer(UPDATE))
-    author_cli(tmp_path, checkout, "--tsd", str(TSD_FILE), "--dry-run")
+    fake.answer(answer(UPDATE_P))
+    author_cli(tmp_path, checkout, "--tsd", str(TSD_FILE), "--dry-run", "--yes")
     pid = _proposal_id(capsys.readouterr().out)
     f = tmp_path / "proposals" / pid / "proposal.json"
     f.write_text(f.read_text().replace("half-up rounding", "something else"))
@@ -613,29 +652,34 @@ def test_cli_apply_refuses_a_tampered_proposal(fake, tmp_path, checkout, capsys)
 
 
 def test_cli_refuses_uncommitted_targets(fake, tmp_path, checkout, capsys):
-    fake.answer(answer(UPDATE))
+    fake.answer(answer(UPDATE_P))
     (checkout / JAVA_TEST).write_text((checkout / JAVA_TEST).read_text() + "// wip\n")
-    assert author_cli(tmp_path, checkout, "--tsd", str(TSD_FILE)) == 1
+    assert author_cli(tmp_path, checkout, "--tsd", str(TSD_FILE), "--yes") == 1
     assert "uncommitted changes" in capsys.readouterr().out
-    assert author_cli(tmp_path, checkout, "--tsd", str(TSD_FILE), "--force") == 0
+    assert author_cli(tmp_path, checkout, "--tsd", str(TSD_FILE), "--force", "--yes") == 0
 
 
 def test_cli_refuses_a_checkout_that_is_not_a_git_repo(fake, tmp_path, capsys):
     plain = tmp_path / "plain"
     shutil.copytree(FIX / "repo", plain)
-    fake.answer(answer(UPDATE))
-    assert author_cli(tmp_path, plain, "--tsd", str(TSD_FILE)) == 1
+    fake.answer(answer(UPDATE_P))
+    assert author_cli(tmp_path, plain, "--tsd", str(TSD_FILE), "--yes") == 1
     assert "not a Git repository" in capsys.readouterr().out and fake.calls() == 0  # refused before the call
-    assert author_cli(tmp_path, plain, "--tsd", str(TSD_FILE), "--force") == 0
+    assert author_cli(tmp_path, plain, "--tsd", str(TSD_FILE), "--force", "--yes") == 0
 
 
-@pytest.mark.parametrize("obj, code", [
-    (answer(questions=[{"clause": "AC-7", "question": "half-up or banker's rounding?"}]), 4),
-    (answer({**CREATE, "clauses": ["AC-99"]}), 5),
+@pytest.mark.parametrize("plan, obj, extra, code", [
+    (plan_answer(questions=[{"clause": "AC-7", "question": "half-up or banker's rounding?"}]), None, ["--yes"], 4),
+    (plan_answer(PLAN_UPDATE, questions=[QUESTION]), None, ["--yes"], 4),  # --yes never skips open questions
+    (PLAN, None, [], 6),
+    (plan_answer(), None, ["--yes"], 4),
+    (PLAN, answer({**CREATE_P, "clauses": ["AC-99"]}), ["--yes"], 5),
+    (PLAN, answer(), ["--yes"], 4),
 ])
-def test_cli_exit_codes(fake, tmp_path, checkout, capsys, obj, code):
-    fake.answer(obj)
-    assert author_cli(tmp_path, checkout, "--tsd", str(TSD_FILE)) == code
+def test_cli_exit_codes(fake, tmp_path, checkout, capsys, plan, obj, extra, code):
+    fake.plan(plan)
+    fake.answer(obj or answer())
+    assert author_cli(tmp_path, checkout, "--tsd", str(TSD_FILE), *extra) == code
 
 
 @pytest.mark.parametrize("mode", ["garbage", "author-invalid"])
@@ -668,11 +712,12 @@ def test_cli_from_run_sends_outdated_tests_and_reuses_the_run_inputs(fake, tmp_p
     case = run.failing()[0]
     case.triage = Triage(category=TriageCategory.TEST_OUTDATED, decided_by="vote")
     store.put_artifact("r-old", "atrf/smoke.json", run.model_dump_json())
-    fake.answer(answer(UPDATE))
-    assert author_cli(tmp_path, checkout, "--from-run", "r-old", "--dry-run") == 0
-    prompt = fake.prompt()
-    outdated = prompt.rsplit('<data name="outdated">', 1)[1].split("</data>", 1)[0]  # the skill names it too
-    assert case.id in outdated and "HALF_UP rounding" in prompt and "ⓘ R-3 · AC-7" in prompt
+    fake.answer(answer(UPDATE_P))
+    assert author_cli(tmp_path, checkout, "--from-run", "r-old", "--dry-run", "--yes") == 0
+    for n in (1, 2):  # plan and generate both see the run's inputs
+        prompt = fake.prompt(n)
+        outdated = prompt.rsplit('<data name="outdated">', 1)[1].split("</data>", 1)[0]  # the skill names it too
+        assert case.id in outdated and "HALF_UP rounding" in prompt and "ⓘ R-3 · AC-7" in prompt
 
 
 def test_doctor_checks_authoring(tmp_path, checkout, capsys):
@@ -694,37 +739,59 @@ def _ctx(checkout, run_id="a1", **kw):
     return RunContext(**base)
 
 
-def _run_orch(profile, stub, tmp_path, store=None):
-    return Orchestrator(profile, store or StateStore(":memory:"), report_dir=tmp_path, author_factory=lambda: stub,
-                        profile_ref=str(LOCAL_PROFILE))
+def _run_orch(profile, stub, tmp_path, store=None, planner=None):
+    planner = planner or StubAgent(PLAN)
+    agents = {"t03-author": stub, "t03-plan": planner}
+    return Orchestrator(profile, store or StateStore(":memory:"), report_dir=tmp_path,
+                        author_factory=lambda skill: agents[skill], profile_ref=str(LOCAL_PROFILE))
 
 
-def test_run_parks_at_t3_then_applies_the_approved_proposal(profile, checkout, tmp_path):
-    stub = StubAgent(answer(UPDATE, CREATE, questions=[{"clause": "AC-8", "question": "partial refunds?"}]))
-    orch = _run_orch(profile, stub, tmp_path)
+def _plan_hash(orch, run_id="a1") -> str:
+    return TestPlan.model_validate_json(orch.store.get_artifact(run_id, "author/plan.json")).hash
+
+
+def _proposal_hash(orch, run_id="a1") -> str:
+    return Proposal.model_validate_json(orch.store.get_artifact(run_id, "author/proposal.json")).hash
+
+
+def test_run_parks_at_the_plan_gate_then_at_the_proposal_gate(profile, checkout, tmp_path):
+    planner = StubAgent(plan_answer(PLAN_UPDATE, PLAN_CREATE, questions=[QUESTION]))
+    stub = StubAgent(answer(UPDATE_P, CREATE_P))
+    orch = _run_orch(profile, stub, tmp_path, planner=planner)
     m = orch.start(_ctx(checkout), context={"tsd": TSD})
-    assert m.status == RunStatus.WAITING_GATE and m.stages[Stage.T3_AUTHOR].status == StageStatus.WAITING_GATE
-    h = Proposal.model_validate_json(orch.store.get_artifact("a1", "author/proposal.json")).hash
-    assert h in m.stages[Stage.T3_AUTHOR].output["gate"]
-    assert orch.store.get_artifact("a1", "author/changes.patch") and not (checkout / NEW_TEST).exists()
-    m = orch.resume("a1")  # resume before approval reuses the stored proposal
-    assert m.status == RunStatus.WAITING_GATE and stub.calls == 1
-    with pytest.raises(ValueError, match="is not the stored T3 proposal"):
+    t3 = m.stages[Stage.T3_AUTHOR]
+    assert m.status == RunStatus.WAITING_GATE and t3.status == StageStatus.WAITING_GATE
+    ph = _plan_hash(orch)
+    assert "T3 plan" in t3.output["gate"] and ph in t3.output["gate"] and "open spec question" in t3.output["gate"]
+    assert "Q-1" in orch.store.get_artifact("a1", "author/answers.yaml")
+    assert "TP-2 create" in orch.store.get_artifact("a1", "author/plan.md") and stub.calls == 0
+    m = orch.resume("a1")  # resume before approval reuses the stored plan
+    assert m.status == RunStatus.WAITING_GATE and planner.calls == 1
+    with pytest.raises(ValueError, match="is not the stored T3 plan"):
         orch.approve("a1", Stage.T3_AUTHOR, "lead-ravi", OWNERS, ref="deadbeef")
+    m = orch.approve("a1", Stage.T3_AUTHOR, "lead-ravi", OWNERS, ref=ph)  # questions left open: allowed
+    h = _proposal_hash(orch)
+    assert m.status == RunStatus.WAITING_GATE and h in m.stages[Stage.T3_AUTHOR].output["gate"] and stub.calls == 1
+    assert "TP-1 [AC-7] update" in stub.blocks["plan"] and not (checkout / NEW_TEST).exists()
+    assert Proposal.model_validate_json(orch.store.get_artifact("a1", "author/proposal.json")).plan_sha256 == ph
+    with pytest.raises(ValueError, match="is not the stored T3 proposal"):
+        orch.approve("a1", Stage.T3_AUTHOR, "lead-ravi", OWNERS, ref=ph)  # a plan hash cannot approve the proposal
     m = orch.approve("a1", Stage.T3_AUTHOR, "lead-ravi", OWNERS, ref=h)
-    assert m.status == RunStatus.SUCCEEDED and stub.calls == 1
-    assert m.gates[0].ref == h and (checkout / NEW_TEST).exists()
+    assert m.status == RunStatus.SUCCEEDED and stub.calls == 1 and planner.calls == 1
+    assert [(g.subject, g.ref) for g in m.gates] == [("plan", ph), ("proposal", h)] and (checkout / NEW_TEST).exists()
     assert m.stages[Stage.T3_AUTHOR].output["applied"] == [JAVA_TEST, NEW_TEST]
     report = orch.store.get_artifact("a1", "report.md")
-    assert "### Test authoring (T3)" in report and "approved by lead-ravi" in report and "partial refunds?" in report
+    assert "### Test authoring (T3)" in report and "approved by lead-ravi" in report
+    assert "Test plan" in report and "partial refunds reverse" in report and "implemented" in report
     kinds = [k for _, k, _ in orch.store.events("a1")]
-    assert kinds.count("agent.call") == 1 and "author.applied" in kinds
+    assert kinds.count("agent.call") == 2 and "author.planned" in kinds and "author.applied" in kinds
 
 
 def test_run_fails_t3_when_the_proposal_changed_after_approval(profile, checkout, tmp_path):
-    orch = _run_orch(profile, StubAgent(answer(UPDATE)), tmp_path)
+    orch = _run_orch(profile, StubAgent(answer(UPDATE_P)), tmp_path)
     orch.start(_ctx(checkout), context={"tsd": TSD})
-    orch.record_gate("a1", Stage.T3_AUTHOR, "approved", "lead-ravi", OWNERS)
+    orch.approve("a1", Stage.T3_AUTHOR, "lead-ravi", OWNERS)  # the plan
+    orch.record_gate("a1", Stage.T3_AUTHOR, "approved", "lead-ravi", OWNERS)  # the proposal
     body = json.loads(orch.store.get_artifact("a1", "author/proposal.json"))
     body["summary"] = "swapped after approval"
     orch.store.put_artifact("a1", "author/proposal.json", json.dumps(body))
@@ -735,10 +802,14 @@ def test_run_fails_t3_when_the_proposal_changed_after_approval(profile, checkout
 
 
 def test_run_with_nothing_to_apply_needs_no_gate(profile, checkout, tmp_path):
-    orch = _run_orch(profile, StubAgent(answer(questions=[{"clause": "AC-7", "question": "q?"}])), tmp_path)
+    orch = _run_orch(profile, StubAgent(answer()), tmp_path, planner=StubAgent(plan_answer()))
     m = orch.start(_ctx(checkout), context={"tsd": TSD})
     assert m.status == RunStatus.SUCCEEDED and m.stages[Stage.T3_AUTHOR].status == StageStatus.DONE
-    assert "nothing to approve" in m.stages[Stage.T3_AUTHOR].output["reason"]
+    assert "no items and no questions" in m.stages[Stage.T3_AUTHOR].output["reason"]
+    orch = _run_orch(profile, StubAgent(answer(questions=[QUESTION])), tmp_path)  # generate finds nothing
+    orch.start(_ctx(checkout), context={"tsd": TSD})
+    m = orch.approve("a1", Stage.T3_AUTHOR, "lead-ravi", OWNERS)
+    assert m.status == RunStatus.SUCCEEDED and "nothing to approve" in m.stages[Stage.T3_AUTHOR].output["reason"]
 
 
 @pytest.mark.parametrize("ctx_kw, authoring, context, reason", [
@@ -764,7 +835,7 @@ def test_author_flag_overrides_a_disabled_profile(checkout, tmp_path):
 
 
 def test_forbidden_author_model_fails_t3_before_any_call(profile, checkout, tmp_path):
-    def factory():
+    def factory(skill):
         raise ValueError("model policy: stage 'author' sees 'restricted' data")
     orch = Orchestrator(profile, StateStore(":memory:"), report_dir=tmp_path, author_factory=factory)
     m = orch.start(_ctx(checkout), context={"tsd": TSD})
@@ -788,17 +859,315 @@ def test_product_skill_reaches_triage_voters(profile):
 
 
 def test_cli_run_with_tests_and_approve_ref(fake, tmp_path, checkout, capsys, monkeypatch):
-    fake.answer(answer(UPDATE))
+    fake.answer(answer(UPDATE_P))
     common = ["--profile", str(LOCAL_PROFILE), "--db", str(tmp_path / "s.db"), "--report-dir", str(tmp_path / "r")]
+    approve = ["approve", "c1", *common, "--gate", "T3", "--user", "lead-ravi", "--groups", "settlement-dept"]
     assert main(["run", *common, "--commit", "mr001", "--merge-base", "base000", "--env", "uat1", "--mode", "assist",
                  "--user", "dev-asha", "--run-id", "c1", "--tsd", str(TSD_FILE), "--tests", str(checkout),
                  "--quiet"]) == 0
     assert "T3   waiting-gate" in capsys.readouterr().out
-    assert main(["approve", "c1", *common, "--gate", "T3", "--user", "lead-ravi", "--groups", "settlement-dept",
-                 "--ref", "0" * 64]) == 1
-    assert "not the stored T3 proposal" in capsys.readouterr().out
-    h = Proposal.model_validate_json(StateStore(tmp_path / "s.db").get_artifact("c1", "author/proposal.json")).hash
+    assert main([*approve, "--ref", "0" * 64]) == 1
+    assert "not the stored T3 plan" in capsys.readouterr().out
+    assert main(["report", "c1", "--db", str(tmp_path / "s.db"), "--artifact", "author/plan.md"]) == 0
+    assert "# Test plan: c1-plan-1" in capsys.readouterr().out
+    assert main(["report", "c1", "--db", str(tmp_path / "s.db"), "--artifact", "raw/smoke"]) == 1  # unmasked: never
+    store = StateStore(tmp_path / "s.db")
+    assert main([*approve, "--ref", TestPlan.model_validate_json(store.get_artifact("c1", "author/plan.json")).hash]) == 0
+    assert "T3   waiting-gate" in capsys.readouterr().out
+    h = Proposal.model_validate_json(store.get_artifact("c1", "author/proposal.json")).hash
     monkeypatch.setenv("FAKE_AGENT_MODE", "answer")  # triage voters after T3 get the triage answer
-    assert main(["approve", "c1", *common, "--gate", "T3", "--user", "lead-ravi", "--groups", "settlement-dept",
-                 "--ref", h]) == 0
+    assert main([*approve, "--ref", h]) == 0
     assert "15.63" in (checkout / JAVA_TEST).read_text()
+
+
+# ------------------------------------------------------------------------- plan phase (engine)
+def make_plan(profile, checkout, out, **inputs):
+    planner = StubAgent(out)
+    parent = inputs.pop("parent", None)
+    drafted = AuthoringEngine(profile, planner=planner).plan(
+        AuthorInputs(tsd=inputs.pop("tsd", TSD), tests_dir=checkout, **inputs), "standalone", parent=parent)
+    return drafted, planner
+
+
+def test_plan_items_get_ids_and_are_checked(profile, checkout):
+    bad = [
+        ({**PLAN_CREATE, "clauses": ["AC-99"]}, "not ⓘ ids"),
+        ({**PLAN_CREATE, "path": "src/main/java/Fee.java"}, "matches no testAuthoring.sources"),
+        ({**PLAN_CREATE, "path": JAVA_TEST}, "does not exist"),
+        ({**PLAN_UPDATE, "path": NEW_TEST}, "file that exists"),
+        ({**PLAN_CREATE, "path": "src/test/java/com/settle/X.java", "clarifications": ["Q-9"]}, "not answered"),
+        ({**PLAN_CREATE, "path": "src/test/java/com/settle/Y.java", "scenario": " "}, "needs a scenario"),
+        ({**PLAN_CREATE, "path": "src/test/java/com/settle/Z.java", "code": "x"}, "unknown field(s) ['code']"),
+    ]
+    drafted, planner = make_plan(profile, checkout, plan_answer(PLAN_UPDATE, *[b for b, _ in bad], PLAN_CREATE))
+    p = drafted.plan
+    assert [(i.id, i.path, i.kind) for i in p.items] == [("TP-1", JAVA_TEST, "code"), ("TP-2", NEW_TEST, "code")]
+    reasons = " | ".join(d.reason for d in p.dropped)
+    for _, why in bad:
+        assert why in reasons
+    assert p.skill == "t03-plan" and "AC-7" in p.clause_ids and "3.2 Fee rounding" in p.section_titles
+    assert "### TP-1 update" in drafted.markdown and "Expected: 15.63" in drafted.markdown
+    assert planner.blocks["clarifications"] == planner.blocks["plan"] == PLACEHOLDER
+
+
+def test_plan_questions_get_ids_that_continue_across_rounds(profile, checkout):
+    first, _ = make_plan(profile, checkout, plan_answer(PLAN_UPDATE, questions=[QUESTION, {"question": "q2?"}]))
+    assert [q.id for q in first.plan.spec_questions] == ["Q-1", "Q-2"]
+    new = answers_from([{"id": "Q-1", "answer": "accept"}, {"id": "Q-2", "answer": ""}], first.plan, "tester-1",
+                       Masker().mask)
+    assert len(new) == 1 and new[0].accepted_assumption and new[0].answer == QUESTION["assumption"]
+    second, planner = make_plan(profile, checkout, plan_answer({**PLAN_CREATE, "clarifications": ["Q-1"]},
+                                                               questions=[{"question": "q3?"}]),
+                                clarifications=new, parent=first.plan)
+    p = second.plan
+    assert p.round == 2 and p.parent == first.plan.id and [q.id for q in p.spec_questions] == ["Q-3"]
+    assert p.items[0].clarifications == ["Q-1"] and p.clarifications == new
+    assert "Q-1 [AC-8] question: do partial refunds" in planner.blocks["clarifications"]
+    assert "Relies on tester answer(s):** Q-1" in second.markdown and "## Clarifications (1)" in second.markdown
+
+
+def test_answers_are_checked_and_masked(profile, checkout):
+    drafted, _ = make_plan(profile, checkout, plan_answer(PLAN_UPDATE, questions=[{"clause": "AC-7", "question": "q?"}]))
+    plan, mask = drafted.plan, authoring_mask(profile)
+    with pytest.raises(ValueError, match="not an open question"):
+        answers_from([{"id": "Q-7", "answer": "x"}], plan, "t", mask)
+    with pytest.raises(ValueError, match="no assumption to accept"):
+        answers_from([{"id": "Q-1", "answer": "accept"}], plan, "t", mask)
+    new = answers_from([{"id": "Q-1", "answer": "use card 4111111111111111"}], plan, "t", mask)
+    assert "4111111111111111" not in new[0].answer and "[PAN****1111]" in new[0].answer
+    _, planner = make_plan(profile, checkout, PLAN, clarifications=new, parent=plan)
+    assert "[PAN****1111]" in planner.blocks["clarifications"] and "4111111111111111" not in planner.blocks["clarifications"]
+
+
+def authoring_mask(profile):
+    from ath_core.authoring.engine import authoring_masker
+    return authoring_masker(profile).mask
+
+
+def test_generate_keeps_only_changes_of_the_approved_plan(profile, checkout):
+    plan = make_plan(profile, checkout, plan_answer({**PLAN_UPDATE, "clarifications": []}, PLAN_CREATE))[0].plan
+    plan.items[0].edited = True
+    out = answer(UPDATE_P, {**CREATE, "plan_items": ["TP-9"]})
+    drafted, agent = propose(profile, checkout, out, plan=plan)
+    p = drafted.proposal
+    assert [c.path for c in p.changes] == [JAVA_TEST] and p.plan_id == plan.id and p.plan_sha256 == plan.hash
+    assert "not in the approved plan" in dropped(drafted)[NEW_TEST]
+    assert "TP-1 were edited by a tester" in " ".join(p.changes[0].flags)
+    assert "| TP-2 | a refund reverses the fee | `" + NEW_TEST + "` | dropped by ATH |" in drafted.checklist
+    assert "TP-1 [AC-7] update " + JAVA_TEST in agent.blocks["plan"]
+    for change, why in (({**CREATE}, "cites no plan item"), ({**CREATE, "plan_items": ["TP-1"]}, "name another file")):
+        assert why in dropped(propose(profile, checkout, answer(change), plan=plan)[0])[NEW_TEST]
+    # without a plan (the engine on its own), changes need no plan items
+    assert propose(profile, checkout, answer(CREATE))[0].proposal.changes
+
+
+def test_clarification_flag_and_unimplemented_items_reach_the_checklist(profile, checkout):
+    first = make_plan(profile, checkout, plan_answer(questions=[QUESTION]))[0].plan
+    new = answers_from([{"id": "Q-1", "answer": "the same share"}], first, "tester-1", Masker().mask)
+    plan = make_plan(profile, checkout, plan_answer(PLAN_UPDATE, {**PLAN_CREATE, "clarifications": ["Q-1"]}),
+                     clarifications=new, parent=first)[0].plan
+    drafted, agent = propose(profile, checkout, answer(CREATE_P), plan=plan, clarifications=plan.clarifications)
+    flags = " ".join(drafted.proposal.changes[0].flags)
+    assert "rely on tester answer(s) Q-1" in flags and "confirm them with the TSD owner" in flags
+    assert "| TP-1 |" in drafted.checklist and "**not implemented**" in drafted.checklist
+    assert "Answer: the same share — tester-1" in drafted.checklist and "confirmed by the TSD owner" in drafted.checklist
+    assert "the same share" in agent.blocks["clarifications"]
+
+
+def test_plan_edits_make_a_new_version(profile, checkout):
+    plan = make_plan(profile, checkout, PLAN)[0].plan
+    ws = Workspace(profile, checkout)
+    assert apply_plan_edits(plan, plan_yaml_of(plan), ws, "t", "plan-2") is None  # unchanged
+    data = yaml.safe_load(plan_yaml_of(plan))
+    data["items"][0]["expected"] = "15.63, never 15.62"
+    del data["items"][1]
+    data["items"].append({"action": "create", "path": "src/test/java/com/settle/clearing/PartialRefundTest.java",
+                          "clauses": ["AC-8"], "scenario": "a partial refund", "expected": "half the fee"})
+    edited = apply_plan_edits(plan, yaml.safe_dump(data), ws, "tester-1", "plan-2")
+    assert edited.id == "plan-2" and edited.parent == plan.id and edited.edited_by == "tester-1"
+    assert [(i.id, i.origin, i.edited) for i in edited.items] == [("TP-1", "model", True), ("TP-3", "tester", False)]
+    assert edited.hash != plan.hash and edited.agent_call == {}
+    for bad, why in (({"id": "TP-7"}, "unknown id TP-7"),
+                     ({"action": "create", "path": "src/main/X.java", "clauses": ["AC-7"], "scenario": "s"},
+                      "matches no testAuthoring.sources"),
+                     ({"action": "create", "path": NEW_TEST, "clauses": ["AC-99"], "scenario": "s"}, "not ⓘ ids")):
+        with pytest.raises(ValueError, match=re.escape(why)):
+            apply_plan_edits(plan, yaml.safe_dump({"items": [bad]}), ws, "t", "plan-3")
+
+
+def plan_yaml_of(plan):
+    from ath_core.authoring.engine import plan_yaml
+    return plan_yaml(plan)
+
+
+def test_proposal_without_a_plan_keeps_its_version_1_hash(profile, checkout):
+    """Stored proposals from before the plan step must keep the hash they were approved with."""
+    p = propose(profile, checkout, answer(UPDATE, questions=[{"question": "q?"}]))[0].proposal
+    data = json.loads(p.canonical_json())
+    for key in ("plan_id", "plan_sha256"):
+        assert key not in data
+    assert "plan_items" not in data["changes"][0] and set(data["spec_questions"][0]) == {"clause", "question"}
+    v1 = hashlib.sha256(json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    assert Proposal.model_validate(data).hash == v1 == p.hash
+
+
+# --------------------------------------------------------------------------- plan phase (CLI)
+def test_cli_questions_answers_file_then_generate(fake, tmp_path, checkout, capsys):
+    fake.plan([plan_answer(PLAN_UPDATE, questions=[QUESTION]),
+               plan_answer(PLAN_UPDATE, {**PLAN_CREATE, "clarifications": ["Q-1"]})])
+    fake.answer(answer(UPDATE_P, CREATE_P))
+    assert author_cli(tmp_path, checkout, "--tsd", str(TSD_FILE)) == 4
+    out = capsys.readouterr().out
+    first = _plan_id(out)
+    folder = tmp_path / "proposals" / first
+    assert "QUESTION Q-1 [AC-8]" in out and f"ainxt-ath author answer {first}" in out
+    assert {f.name for f in folder.iterdir()} >= {"plan.json", "plan.yaml", "plan.md", "answers.yaml", "inputs.json"}
+    assert json.loads((folder / "inputs.json").read_text())["tsd"] == str(TSD_FILE.resolve())
+    assert author_cli(tmp_path, checkout, "answer", first) == 1  # the sheet still has no answer
+    assert "no answers in" in capsys.readouterr().out
+    sheet = yaml.safe_load((folder / "answers.yaml").read_text())
+    sheet["answers"][0]["answer"] = "yes, the same share of the fee"
+    (folder / "answers.yaml").write_text(yaml.safe_dump(sheet))
+    assert author_cli(tmp_path, checkout, "answer", first) == 6  # planned again: ready for review
+    out = capsys.readouterr().out
+    second = _plan_id(out)
+    plan = load_plan(tmp_path / "proposals" / second)
+    assert plan.parent == first and plan.round == 2 and plan.clarifications[0].answer == "yes, the same share of the fee"
+    assert "yes, the same share of the fee" in fake.prompt(2).rsplit('<data name="clarifications">', 1)[1]
+    assert author_cli(tmp_path, checkout, "generate", second, "--dry-run") == 0
+    out = capsys.readouterr().out
+    assert f"from plan {second}" in out and "rely on tester answer(s) Q-1" in out
+    checklist = (tmp_path / "proposals" / _proposal_id(out) / "checklist.md").read_text()
+    assert "## Plan coverage" in checklist and "## Clarifications (1)" in checklist
+    kinds = [k for _, k, _ in StateStore(tmp_path / "state.db").events(first)]
+    assert kinds == ["agent.call", "author.planned", "author.answered"] and fake.calls() == 3
+
+
+def test_cli_generate_uses_the_edited_plan(fake, tmp_path, checkout, capsys):
+    fake.answer(answer(UPDATE_P, CREATE_P))
+    assert author_cli(tmp_path, checkout, "--tsd", str(TSD_FILE)) == 6
+    plan_id = _plan_id(capsys.readouterr().out)
+    plan_file = tmp_path / "proposals" / plan_id / "plan.yaml"
+    data = yaml.safe_load(plan_file.read_text())
+    assert data["plan"] == plan_id and data["plan_sha256"]
+    data["items"] = [{**data["items"][0], "expected": "15.63 exactly"}]
+    plan_file.write_text(yaml.safe_dump(data))
+    assert author_cli(tmp_path, checkout, "generate", plan_id, "--dry-run") == 0
+    out = capsys.readouterr().out
+    assert "plan edited: new version" in out and "TP-1 were edited by a tester" in out
+    assert "DROPPED " + NEW_TEST in out and "not in the approved plan" in out
+    data["items"][0]["path"] = "build.gradle"
+    plan_file.write_text(yaml.safe_dump(data))
+    assert author_cli(tmp_path, checkout, "generate", plan_id) == 1 and "testAuthoring.sources" in capsys.readouterr().out
+
+
+def test_cli_interactive_answers_review_and_generate(fake, tmp_path, checkout, capsys, monkeypatch):
+    import ath_cli.main as cli
+    typed = iter(["a", "y"])  # accept the assumption for Q-1, then generate
+    monkeypatch.setattr(cli, "_interactive", lambda a: True)
+    monkeypatch.setattr(cli, "_ask", lambda prompt="": next(typed))
+    fake.plan([plan_answer(PLAN_UPDATE, questions=[QUESTION]),
+               plan_answer(PLAN_UPDATE, {**PLAN_CREATE, "clarifications": ["Q-1"]})])
+    fake.answer(answer(UPDATE_P, CREATE_P))
+    assert author_cli(tmp_path, checkout, "--tsd", str(TSD_FILE), "--dry-run") == 0
+    out = capsys.readouterr().out
+    assert "assumption: a partial refund reverses the same share" in out and "planning again with 1 answer" in out
+    assert fake.calls() == 3 and "the model's assumption, accepted" in (
+        tmp_path / "proposals" / _proposal_id(out) / "checklist.md").read_text()
+    first = sorted((tmp_path / "proposals").glob("plan-*/answers.yaml"))[0]
+    assert "a partial refund reverses the same share" in yaml.safe_load(first.read_text())["answers"][0]["answer"]
+
+
+def test_cli_answer_rounds_are_capped(fake, tmp_path, checkout, capsys):
+    prof = profile_with(tmp_path, limits={"maxRounds": 1})
+    fake.plan(plan_answer(PLAN_UPDATE, questions=[QUESTION]))
+    args = ["--profile", str(prof), "--tests", str(checkout), "--db", str(tmp_path / "db"), "--out", str(tmp_path / "p")]
+    assert main(["author", *args, "--tsd", str(TSD_FILE)]) == 4
+    plan_id = _plan_id(capsys.readouterr().out)
+    sheet = tmp_path / "p" / plan_id / "answers.yaml"
+    sheet.write_text(sheet.read_text().replace("answer: ''", "answer: accept"))
+    assert main(["author", "answer", plan_id, *args]) == 1
+    assert "the limit (testAuthoring.limits.maxRounds 1)" in capsys.readouterr().out and fake.calls() == 1
+
+
+# --------------------------------------------------------------------------- plan phase (run)
+def test_run_answers_replan_and_plan_edits(profile, checkout, tmp_path):
+    planner = StubAgent([plan_answer(PLAN_UPDATE, questions=[QUESTION]),
+                         plan_answer(PLAN_UPDATE, {**PLAN_CREATE, "clarifications": ["Q-1"]}, questions=[
+                             {"clause": "AC-7", "question": "which currency?", "assumption": "INR"}])])
+    prof = load_profile(profile_with(tmp_path, limits={"maxRounds": 2}))
+    orch = _run_orch(prof, StubAgent(answer(UPDATE_P, CREATE_P)), tmp_path, planner=planner)
+    orch.start(_ctx(checkout), context={"tsd": TSD})
+    first = _plan_hash(orch)
+    with pytest.raises(ValueError, match="not the stored T3 plan"):
+        orch.answer("a1", "lead-ravi", OWNERS, "0" * 64, answers=[{"id": "Q-1", "answer": "x"}])
+    with pytest.raises(PermissionError, match="neither triggered this run nor"):
+        orch.answer("a1", "someone", [], first, answers=[{"id": "Q-1", "answer": "x"}])
+    m = orch.answer("a1", "dev-asha", [], first, answers=[{"id": "Q-1", "answer": "the same share"}])
+    plan = TestPlan.model_validate_json(orch.store.get_artifact("a1", "author/plan.json"))
+    assert m.status == RunStatus.WAITING_GATE and planner.calls == 2 and plan.round == 2
+    assert plan.id == "a1-plan-2" and plan.parent == "a1-plan-1" and [q.id for q in plan.spec_questions] == ["Q-2"]
+    assert "the same share" in planner.blocks["clarifications"]
+    assert orch.store.get_artifact("a1", "author/rounds/a1-plan-1/plan.json")
+    with pytest.raises(ValueError, match="maxRounds"):  # round 2 of 2
+        orch.answer("a1", "dev-asha", [], plan.hash, answers=[{"id": "Q-2", "answer": "INR"}])
+    edited_yaml = orch.store.get_artifact("a1", "author/plan.yaml").replace("expected: '15.63'", "expected: 15.63 INR")
+    m = orch.answer("a1", "dev-asha", [], plan.hash, plan_yaml_text=edited_yaml)  # no model call
+    edited = TestPlan.model_validate_json(orch.store.get_artifact("a1", "author/plan.json"))
+    assert planner.calls == 2 and edited.id == "a1-plan-2-e1" and edited.items[0].edited
+    assert edited.hash in m.stages[Stage.T3_AUTHOR].output["gate"]
+    m = orch.approve("a1", Stage.T3_AUTHOR, "lead-ravi", OWNERS, ref=edited.hash)
+    with pytest.raises(ValueError, match="no T3 plan waiting"):
+        orch.answer("a1", "dev-asha", [], edited.hash, answers=[{"id": "Q-2", "answer": "INR"}])
+    m = orch.approve("a1", Stage.T3_AUTHOR, "lead-ravi", OWNERS, ref=_proposal_hash(orch))
+    assert m.status == RunStatus.SUCCEEDED
+    report = orch.store.get_artifact("a1", "report.md")
+    assert "Clarifications (tester answers" in report and "edited by tester" in report
+    kinds = [k for _, k, _ in orch.store.events("a1")]
+    assert kinds.count("author.planned") == 2 and "author.answered" in kinds and "author.plan_edited" in kinds
+
+
+def test_run_questions_only_plan_parks_and_can_go_on_without_answers(profile, checkout, tmp_path):
+    orch = _run_orch(profile, StubAgent(answer()), tmp_path, planner=StubAgent(plan_answer(questions=[QUESTION])))
+    m = orch.start(_ctx(checkout), context={"tsd": TSD})
+    assert m.status == RunStatus.WAITING_GATE and "approve 0 test plan item(s)" in m.stages[Stage.T3_AUTHOR].output["gate"]
+    m = orch.approve("a1", Stage.T3_AUTHOR, "lead-ravi", OWNERS, ref=_plan_hash(orch))
+    assert m.status == RunStatus.SUCCEEDED and "approved plan has no items" in m.stages[Stage.T3_AUTHOR].output["reason"]
+
+
+def test_run_parked_before_the_plan_step_keeps_its_proposal(profile, checkout, tmp_path):
+    """A run that reached T3 before plans existed waits with a proposal and no plan: it goes on as it was."""
+    stub, planner = StubAgent(answer(UPDATE)), StubAgent(PLAN)
+    orch = _run_orch(profile, stub, tmp_path, planner=planner)
+    orch.start(_ctx(checkout), context={"tsd": TSD})
+    drafted = propose(profile, checkout, answer(UPDATE))[0]
+    orch.store.put_artifact("a1", "author/plan.json", "")
+    orch.store.put_artifact("a1", "author/proposal.json", drafted.proposal.canonical_json())
+    m = orch.approve("a1", Stage.T3_AUTHOR, "lead-ravi", OWNERS, ref=drafted.proposal.hash)
+    assert m.status == RunStatus.SUCCEEDED and m.gates[0].subject is None and "15.63" in (checkout / JAVA_TEST).read_text()
+
+
+def test_api_answers_t3(checkout, tmp_path, monkeypatch):
+    pytest.importorskip("fastapi")
+    import importlib
+
+    from fastapi.testclient import TestClient
+    monkeypatch.setenv("ATH_DB", str(tmp_path / "api.db"))
+    import ath_server.api.app as appmod
+    importlib.reload(appmod)
+    planner = StubAgent([plan_answer(PLAN_UPDATE, questions=[QUESTION]), PLAN])
+    agents = {"t03-plan": planner, "t03-author": StubAgent(answer(UPDATE_P))}
+    monkeypatch.setattr(appmod, "build_author_agent", lambda cfg, profile, skill: agents[skill])
+    orch = appmod._orchestrator("settlenxt", "test-profile.local.yaml")
+    orch.start(_ctx(checkout), context={"tsd": TSD})
+    client, user = TestClient(appmod.app), {"X-ATH-User": "dev-asha"}
+    url = "/runs/a1/gates/T3/answer"
+    assert "Q-1" in client.get("/runs/a1/artifacts/author/answers.yaml", headers=user).text
+    assert client.get("/runs/a1/artifacts/raw/smoke", headers=user).status_code == 404
+    body = {"ref": "0" * 64, "answers": [{"id": "Q-1", "answer": "yes"}]}
+    assert client.post(url, json=body, headers=user).status_code == 409
+    assert client.post(url, json={**body, "ref": _plan_hash(orch)}, headers={"X-ATH-User": "x"}).status_code == 403
+    r = client.post(url, json={**body, "ref": _plan_hash(orch)}, headers=user)
+    assert r.status_code == 202 and r.json()["decision"] == "answered"
+    plan = TestPlan.model_validate_json(appmod.STORE.get_artifact("a1", "author/plan.json"))
+    assert plan.round == 2 and planner.calls == 2 and plan.clarifications[0].by == "dev-asha"

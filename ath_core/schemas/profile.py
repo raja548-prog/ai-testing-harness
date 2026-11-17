@@ -129,6 +129,10 @@ class AuthoringLimits(_Model):
     templates_chars: int = Field(8000, alias="templatesChars", ge=500)
     diff_chars: int = Field(8000, alias="diffChars", ge=500)
     outdated_chars: int = Field(6000, alias="outdatedChars", ge=500)
+    clarifications_chars: int = Field(6000, alias="clarificationsChars", ge=500)  # answered spec questions
+    plan_chars: int = Field(12000, alias="planChars", ge=500)                     # approved plan, to the author
+    plan_items: int = Field(40, alias="planItems", ge=1, le=400)                  # scenarios per plan
+    max_rounds: int = Field(3, alias="maxRounds", ge=1, le=10)                    # planning rounds (answers)
 
 
 class TestAuthoring(_Model):

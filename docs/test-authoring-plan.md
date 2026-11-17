@@ -494,3 +494,27 @@ Gaps found in the plan above, and how the code settles them.
   call, not the whole run at start. The API's gate endpoint also takes `ref`.
 - **Profile hash.** New `testAuthoring` defaults change the profile hash of existing profiles that have
   `testAuthoring`. Gates of runs started before the upgrade must be decided with the old version.
+
+
+## Plan phase and clarification rounds (added later)
+
+A dry run used to stop at the model's spec questions, and the only way forward was to edit the TSD and run
+again, which an `--rh-package` TSD (hash-locked at sign-off) does not even allow. T3 now has two phases:
+
+1. **Plan** (skill `t03-plan`, `AuthoringEngine.plan`): the TSD becomes a `TestPlan`. It has items
+   `TP-n` (clauses, scenario, expected result, target file, create or update) and spec questions `Q-n`,
+   each with the model's assumption. Items pass the same path, create/update and traceability checks as
+   changes. A tester answers questions (`Clarification`s, masked, ids unique across rounds) and T3 plans
+   again, up to `limits.maxRounds`. The tester can also edit `plan.yaml` (`apply_plan_edits`: a new plan
+   version, no model call, with items marked `edited` or `origin: tester`) and approve the plan by its hash.
+2. **Generate** (skill `t03-author`, `AuthoringEngine.propose` with `inputs.plan`): only changes that
+   cite approved `plan_items` on the item's own file are kept. Expectations that rest on a clarification
+   or a tester edit get review flags, and the checklist has a plan-coverage table and a clarifications
+   section for the TSD owner.
+
+Standalone: `author` (plan) → `author answer <plan>` → `author generate <plan>` → `author apply <proposal>`,
+interactive at a terminal; exit 4 means open questions, 6 means the plan is waiting for review, and
+`--yes` runs plan and generate in one step. In a run: a plan gate (`approve --ref <plan hash>`, or
+`ainxt-ath answer` / `POST /runs/{id}/gates/T3/answer` while it waits), then the proposal gate.
+`GateDecision.subject` (`plan` | `proposal`) tells the two T3 approvals apart. Proposals stored before
+this change keep their hash: the new keys are left out of the canonical JSON while they hold defaults.

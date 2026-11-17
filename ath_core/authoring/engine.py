@@ -1,11 +1,20 @@
-"""T3 authoring engine: one model call turns TSD clauses into proposed test changes, checked by ATH.
+"""T3 authoring engine, in two phases. Each phase is one model call whose output ATH checks.
 
-Used by `ainxt-ath author` (standalone, no run) and by stage T3 of a run. Steps:
+Used by `ainxt-ath author` (standalone, no run) and by stage T3 of a run.
+
+Phase 1, plan (skill t03-plan): the TSD becomes a test plan, one item per scenario with its expected
+result and target file, plus spec questions for clauses the TSD leaves unclear. A tester answers the
+questions (`Clarification`s: they refine a clause, they never edit the TSD) and plans again, edits the
+plan if needed, and approves it.
+
+Phase 2, generate (skill t03-author), for the approved plan only:
   1. gather context: one masked, size-capped <data> block per input, selected deterministically
   2. one call to skill t03-author (a single author; a human reviews the result)
   3. parse its JSON change by change
-  4. guards: a change that breaks a rule is dropped with the reason, never written
-  5. review flags: weakened tests, new imports, risky API calls (they do not drop the change)
+  4. guards: a change that breaks a rule, or implements no approved plan item, is dropped with the
+     reason, never written
+  5. review flags: weakened tests, new imports, risky API calls, expectations resting on a tester's
+     answer or plan edit (they do not drop the change)
   6. the proposal (with its hash), rendered as changes.patch and checklist.md from masked text
 Applying (step 7) is the TestAuthor adapter's job (ath_core/adapters/author/local_fs.py); it re-runs
 the same `Workspace.realize` checks against the files as they are then.
@@ -18,7 +27,9 @@ import re
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
+
+import yaml
 
 from ath_core.authoring.flags import assertion_lines, review_flags
 from ath_core.authoring.formats import (
@@ -32,14 +43,18 @@ from ath_core.context import (
 )
 from ath_core.masking import CATEGORIES, Masker
 from ath_core.schemas.authoring import (
-    AcceptedChange, Change, DroppedChange, Proposal, parse_output,
+    AcceptedChange, Change, Clarification, DroppedChange, PlanItem, Proposal, TestPlan, parse_output,
+    parse_plan_output, plan_item,
 )
 from ath_core.schemas.profile import TestProfile, TestSource
+from ath_core.schemas.run import utcnow
 
 SKILL = "t03-author"
+PLAN_SKILL = "t03-plan"
 PLACEHOLDER = "(not attached)"
 BLOCKS = ("tsd", "tests", "tree", "conventions", "testdata", "product", "code", "templates", "diff", "impact",
-          "outdated")
+          "outdated", "clarifications", "plan")
+ACCEPT = ("accept", "a")  # an answer that takes the model's own assumption
 _WHAT = {"pan": "a card number", "cvv": "a card security code", "track2": "card track data",
          "aadhaar": "an Aadhaar number", "mobile": "a mobile number", "pinblock": "a PIN block"}
 
@@ -60,6 +75,8 @@ class AuthorInputs:
     diff: str | None = None
     outdated: list[dict[str, str]] | None = None  # [{id, suite, name, message}] marked test-outdated by triage
     impact: str | None = None
+    clarifications: list[Clarification] | None = None  # answered spec questions, masked
+    plan: TestPlan | None = None  # generate phase: the approved plan; its files are sent first
 
 
 def authoring_masker(profile: TestProfile) -> Masker:
@@ -223,6 +240,24 @@ class Workspace:
             raise GuardError("the edits change nothing")
         return Realized(source, view.file.encode(raw_new), view.masked, masked_new, view.sha256)
 
+    def check_plan_item(self, item: PlanItem, editable: set[str] | None, answered: set[str]) -> TestSource:
+        """The checks a plan item must pass, or GuardError: the same path and create/update rules as a
+        change, and every clarification it cites was answered. `editable` None skips the sent-whole
+        check (tester edits: generation sends plan files first, and `realize` checks again)."""
+        target, source = self.check_path(item.path)
+        if not item.scenario.strip():
+            raise GuardError("a plan item needs a scenario")
+        if item.action == "create" and (target.exists() or target.is_symlink()):
+            raise GuardError("create is only for a file that does not exist; use update")
+        if item.action == "update":
+            if not target.is_file():
+                raise GuardError("update is only for a file that exists; use create")
+            if editable is not None and item.path not in editable:
+                raise GuardError("the file was not sent whole to the model, so it cannot be updated")
+        if bad := [q for q in item.clarifications if q not in answered]:
+            raise GuardError(f"cites clarification(s) {bad} that were not answered")
+        return source
+
 
 # ------------------------------------------------------------------------------------------ context
 @dataclass
@@ -273,12 +308,14 @@ def module_globs(product_skill_text: str) -> list[str]:
 
 
 class AuthoringEngine:
-    def __init__(self, profile: TestProfile, agent: AuthorAgent | None = None):
+    def __init__(self, profile: TestProfile, agent: AuthorAgent | None = None, planner: AuthorAgent | None = None):
+        """`agent` runs skill t03-author (generate), `planner` skill t03-plan (plan)."""
         if profile.test_authoring is None:
             raise ValueError(f"profile {profile.product} has no testAuthoring section")
         self.profile = profile
         self.ta = profile.test_authoring
         self.agent = agent
+        self.planner = planner
 
     def gather(self, ws: Workspace, inputs: AuthorInputs) -> Gathered:
         lim, mask = self.ta.limits, ws.masker.mask
@@ -314,7 +351,10 @@ class AuthoringEngine:
                 continue
             (views.append(v) if v is not None else unreadable.append(rel))
         chosen, used = [], 0
-        for i in rank([(v.path, v.masked) for v in views], wanted):
+        # The approved plan's files go first, so an update it plans finds its file sent whole.
+        planned = {i.path for i in inputs.plan.items} if inputs.plan else set()
+        order = sorted(rank([(v.path, v.masked) for v in views], wanted), key=lambda i: views[i].path not in planned)
+        for i in order:
             text = _file_block(views[i])
             if len(chosen) >= lim.test_files or used + len(text) > lim.tests_chars:
                 continue
@@ -361,6 +401,11 @@ class AuthoringEngine:
             lines = [f"- {c.get('id', '')} ({c.get('suite', '')}): {c.get('name', '')}\n  failure: "
                      f"{' '.join(str(c.get('message', '')).split())[:500]}" for c in inputs.outdated]
             blocks["outdated"] = _cap(mask("\n".join(lines)), lim.outdated_chars)
+        if inputs.clarifications:
+            blocks["clarifications"] = _cap(mask(clarifications_text(inputs.clarifications)),
+                                            lim.clarifications_chars)
+        if inputs.plan:
+            blocks["plan"] = _cap(mask(plan_text(inputs.plan)), lim.plan_chars)
         return Gathered(blocks, {v.path for v in chosen}, tsd_sent, notes, product.version if product else "")
 
     def _code_block(self, code_dir: Path, product_text: str, wanted: set[str], mask, notes: list[str]) -> str:
@@ -402,28 +447,82 @@ class AuthoringEngine:
                 parts.append((f, f"===== template: {f} =====\n{tf.text.rstrip()}\n"))
         return mask(pick(parts, wanted, self.ta.limits.templates_chars, "template(s)"))
 
+    @staticmethod
+    def _call(agent: AuthorAgent, blocks: dict[str, str]) -> tuple[dict[str, Any], dict[str, Any]]:
+        try:
+            out = agent.run(blocks)
+        finally:
+            call = dict(getattr(agent, "last_call", {}) or {})
+        return out, call
+
+    # -------------------------------------------------------------------------------------- plan
+    def plan(self, inputs: AuthorInputs, source: str, plan_id: str | None = None,
+             parent: TestPlan | None = None) -> "DraftedPlan":
+        """Phase 1: gather, call the planner once, check every plan item. `parent` is the plan whose
+        questions `inputs.clarifications` answer. Raises ValueError for unusable input and the agent's
+        own error (AgentError) when the call fails."""
+        if self.planner is None:
+            raise ValueError("no planning agent configured")
+        ws = Workspace(self.profile, inputs.tests_dir)
+        g = self.gather(ws, inputs)
+        out, call = self._call(self.planner, g.blocks)
+        parsed = parse_plan_output(out)
+        m = ws.masker.mask
+        answered = {c.id for c in inputs.clarifications or []}
+        # Q ids continue across rounds, so an answer always names one question.
+        seen = answered | {q.id for q in (parent.spec_questions if parent else [])}
+        n = _max_num(seen, "Q")
+        for q in parsed.spec_questions:
+            n += 1
+            q.id, q.clause, q.question, q.assumption = f"Q-{n}", m(q.clause), m(q.question), m(q.assumption)
+        ids = tsd_clause_ids(g.tsd_sent)
+        sections = [s.title for s in tsd_sections(g.tsd_sent) if s.title]
+        titles = {t.casefold(): t for t in sections}
+        items: list[PlanItem] = []
+        dropped = [DroppedChange(action="?", path=m(p), reason=m(why)) for p, why in parsed.malformed]
+        for it in parsed.items:
+            it.scenario, it.expected, it.clauses = m(it.scenario), m(it.expected), [m(c) for c in it.clauses]
+            try:
+                if len(items) >= self.ta.limits.plan_items:
+                    raise GuardError(f"over the limit of {self.ta.limits.plan_items} plan items")
+                it.traced_by = _trace(it.clauses, ids, titles)
+                it.kind = ws.check_plan_item(it, g.editable, answered).kind
+            except GuardError as e:
+                dropped.append(DroppedChange(action=it.action, path=m(it.path), reason=m(str(e)), clauses=it.clauses))
+                continue
+            it.id = f"TP-{len(items) + 1}"
+            items.append(it)
+        plan = TestPlan(
+            id=plan_id or f"plan-{uuid.uuid4().hex[:10]}", parent=parent.id if parent else "",
+            round=parent.round + 1 if parent else 1, product=self.profile.product, source=source,
+            model=getattr(self.planner, "model", ""), skill=PLAN_SKILL, product_skill_version=g.product_skill_version,
+            tsd_sha256=sha256_bytes(g.tsd_sent.encode("utf-8")), prompt_sha256=str(call.get("prompt_sha256", "")),
+            clause_ids=sorted(ids), section_titles=sections, blocks={k: len(v) for k, v in g.blocks.items()},
+            items=items, dropped=dropped, spec_questions=parsed.spec_questions,
+            clarifications=list(inputs.clarifications or []), summary=m(parsed.summary), agent_call=call)
+        return DraftedPlan(plan, render_plan_md(plan, g.notes))
+
     # ---------------------------------------------------------------------------------- proposal
     def propose(self, inputs: AuthorInputs, source: str, proposal_id: str | None = None) -> "Drafted":
-        """Gather, call the model once, check every change. Raises ValueError for unusable input and
-        the agent's own error (AgentError) when the call fails."""
+        """Phase 2: gather, call the model once, check every change. With `inputs.plan`, only changes that
+        implement its items are kept. Raises ValueError for unusable input and the agent's own error
+        (AgentError) when the call fails."""
         if self.agent is None:
             raise ValueError("no author agent configured")
         ws = Workspace(self.profile, inputs.tests_dir)
         g = self.gather(ws, inputs)
-        try:
-            out = self.agent.run(g.blocks)
-        finally:
-            call = dict(getattr(self.agent, "last_call", {}) or {})
+        out, call = self._call(self.agent, g.blocks)
         parsed = parse_output(out)
         # Free text the model wrote is stored and shown: mask it like everything else.
         m = ws.masker.mask
         parsed.summary = m(parsed.summary)
         for q in parsed.spec_questions:
-            q.clause, q.question = m(q.clause), m(q.question)
+            q.clause, q.question, q.assumption = m(q.clause), m(q.question), m(q.assumption)
         for ch in parsed.changes:
-            ch.reason, ch.clauses = m(ch.reason), [m(c) for c in ch.clauses]
+            ch.reason, ch.clauses, ch.plan_items = m(ch.reason), [m(c) for c in ch.clauses], [m(p) for p in ch.plan_items]
         ids = tsd_clause_ids(g.tsd_sent)
         titles = {s.title.casefold(): s.title for s in tsd_sections(g.tsd_sent) if s.title}
+        plan = inputs.plan
         accepted: list[AcceptedChange] = []
         rendered: list[tuple[AcceptedChange, str, str]] = []
         dropped = [DroppedChange(action="?", path=m(p), reason=m(why)) for p, why in parsed.malformed]
@@ -434,15 +533,16 @@ class AuthoringEngine:
                 if any(a.path == ch.path for a in accepted):
                     raise GuardError("the same file is changed twice; send one change per file")
                 traced_by = _trace(ch.clauses, ids, titles)
+                items = _plan_items(ch, plan) if plan else []
                 r = ws.realize(ch, editable=g.editable)
             except GuardError as e:
                 dropped.append(DroppedChange(action=ch.action, path=m(ch.path), reason=m(str(e)), clauses=ch.clauses))
                 continue
             acc = AcceptedChange(
                 action=ch.action, path=ch.path, kind=r.source.kind, format=r.source.edit_format,
-                clauses=ch.clauses, traced_by=traced_by, reason=ch.reason, content=ch.content, edits=ch.edits,
-                base_sha256=r.base_sha256, result_sha256=sha256_bytes(r.new_bytes),
-                flags=review_flags(r.masked_old, r.masked_new, r.source.kind))
+                clauses=ch.clauses, traced_by=traced_by, plan_items=ch.plan_items, reason=ch.reason,
+                content=ch.content, edits=ch.edits, base_sha256=r.base_sha256, result_sha256=sha256_bytes(r.new_bytes),
+                flags=review_flags(r.masked_old, r.masked_new, r.source.kind) + _plan_flags(items))
             accepted.append(acc)
             rendered.append((acc, r.masked_old, r.masked_new))
         proposal = Proposal(
@@ -452,8 +552,40 @@ class AuthoringEngine:
             tsd_sha256=sha256_bytes(g.tsd_sent.encode("utf-8")), prompt_sha256=str(call.get("prompt_sha256", "")),
             blocks={k: len(v) for k, v in g.blocks.items()}, changes=accepted, dropped=dropped,
             spec_questions=parsed.spec_questions, summary=parsed.summary, agent_call=call,
-            proposed_count=len(parsed.changes) + len(parsed.malformed))
-        return Drafted(proposal, render_patch(rendered), render_checklist(proposal, rendered, g.notes))
+            proposed_count=len(parsed.changes) + len(parsed.malformed),
+            plan_id=plan.id if plan else "", plan_sha256=plan.hash if plan else "")
+        return Drafted(proposal, render_patch(rendered), render_checklist(proposal, rendered, g.notes, plan))
+
+
+def _max_num(ids: set[str], prefix: str) -> int:
+    nums = [int(i.split("-", 1)[1]) for i in ids if re.fullmatch(rf"{prefix}-\d+", i)]
+    return max(nums, default=0)
+
+
+def _plan_items(ch: Change, plan: TestPlan) -> list[PlanItem]:
+    """The approved plan items a change implements, or GuardError."""
+    by_id = {i.id: i for i in plan.items}
+    if not ch.plan_items:
+        raise GuardError("cites no plan item; every change must implement an approved plan item")
+    if bad := [p for p in ch.plan_items if p not in by_id]:
+        raise GuardError(f"plan item(s) {bad} are not in the approved plan {plan.id}")
+    items = [by_id[p] for p in ch.plan_items]
+    if other := [i.id for i in items if i.path != ch.path]:
+        raise GuardError(f"plan item(s) {other} name another file, not this one")
+    return items
+
+
+def _plan_flags(items: list[PlanItem]) -> list[str]:
+    """Review flags for expectations that do not come from the signed-off TSD alone."""
+    flags = []
+    if qs := sorted({q for i in items for q in i.clarifications}):
+        flags.append(f"expected values rely on tester answer(s) {', '.join(qs)}, not on the signed-off TSD; "
+                     f"confirm them with the TSD owner")
+    if added := [i.id for i in items if i.origin == "tester"]:
+        flags.append(f"plan item(s) {', '.join(added)} were added by a tester")
+    if edited := [i.id for i in items if i.origin == "model" and i.edited]:
+        flags.append(f"plan item(s) {', '.join(edited)} were edited by a tester")
+    return flags
 
 
 def _trace(clauses: list[str], ids: set[str], titles: dict[str, str]) -> str:
@@ -480,6 +612,12 @@ class Drafted:
     checklist: str
 
 
+@dataclass
+class DraftedPlan:
+    plan: TestPlan
+    markdown: str
+
+
 # ---------------------------------------------------------------------------------------- rendering
 def _lines(text: str) -> list[str]:
     lines = text.splitlines(keepends=True)
@@ -497,12 +635,101 @@ def render_patch(rendered: list[tuple[AcceptedChange, str, str]]) -> str:
     return "".join(out)
 
 
-def render_checklist(p: Proposal, rendered: list[tuple[AcceptedChange, str, str]], notes: list[str]) -> str:
+def _one_line(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _question_line(q) -> str:
+    head = f"{q.id} " if q.id else ""
+    line = f"- {head}{('[' + q.clause + '] ') if q.clause else ''}{_one_line(q.question)}"
+    return line + (f"\n  - Assumption if unanswered: {_one_line(q.assumption)}" if q.assumption else "")
+
+
+def _clarification_lines(clarifications: list[Clarification]) -> list[str]:
+    lines = ["Tester answers to spec questions. They are not in the signed-off TSD: send them to the TSD "
+             "owner so the TSD can be updated.", ""]
+    for c in clarifications:
+        how = " (the model's assumption, accepted)" if c.accepted_assumption else ""
+        lines.append(f"- {c.id} {('[' + c.clause + '] ') if c.clause else ''}{_one_line(c.question)}")
+        lines.append(f"  - Answer{how}: {_one_line(c.answer)} — {c.by or 'unknown'}, {c.at:%Y-%m-%d}")
+    return lines + [""]
+
+
+def clarifications_text(clarifications: list[Clarification]) -> str:
+    """The `clarifications` block for the model."""
+    return "\n".join(f"- {c.id} [{c.clause or 'no clause'}] question: {_one_line(c.question)}\n"
+                     f"  answer: {_one_line(c.answer)}" for c in clarifications)
+
+
+def plan_text(plan: TestPlan) -> str:
+    """The `plan` block for the author: the approved items only."""
+    out = []
+    for i in plan.items:
+        out.append(f"- {i.id} [{', '.join(i.clauses)}] {i.action} {i.path}\n  scenario: {_one_line(i.scenario)}\n"
+                   f"  expected: {_one_line(i.expected) or '(see the clauses)'}"
+                   + (f"\n  clarifications: {', '.join(i.clarifications)}" if i.clarifications else ""))
+    return "\n".join(out) or "(the approved plan has no items)"
+
+
+def render_plan_md(p: TestPlan, notes: list[str] | None = None) -> str:
+    lines = [f"# Test plan: {p.id}", "",
+             f"Product `{p.product}` · source `{p.source}` · model `{p.model or '(none)'}` · skill `{p.skill}` · "
+             f"round {p.round}" + (f" · follows `{p.parent}`" if p.parent else "")
+             + (f" · edited by {p.edited_by}" if p.edited_by else ""), ""]
+    lines += [f"## Scenarios ({len(p.items)})", ""]
+    if not p.items:
+        lines += ["None.", ""]
+    for i in p.items:
+        who = " · added by a tester" if i.origin == "tester" else " · edited by a tester" if i.edited else ""
+        lines.append(f"### {i.id} {i.action} `{i.path}` ({i.kind or '?'}){who}")
+        trace = ", ".join(i.clauses) + (" (traced by section title only)" if i.traced_by == "title" else "")
+        lines.append(f"- Clauses: {trace}")
+        lines.append(f"- Scenario: {_one_line(i.scenario)}")
+        lines.append(f"- Expected: {_one_line(i.expected) or '(not given)'}")
+        if i.clarifications:
+            lines.append(f"- **Relies on tester answer(s):** {', '.join(i.clarifications)}")
+        lines.append("")
+    if p.spec_questions:
+        lines += [f"## Open spec questions ({len(p.spec_questions)})", "",
+                  "Clauses with an open question are not planned. Answer them in answers.yaml "
+                  "(`accept` takes the assumption).", ""]
+        lines += [_question_line(q) for q in p.spec_questions] + [""]
+    if p.clarifications:
+        lines += [f"## Clarifications ({len(p.clarifications)})", ""] + _clarification_lines(p.clarifications)
+    if p.dropped:
+        lines += [f"## Dropped by ATH ({len(p.dropped)})", ""]
+        lines += [f"- `{d.path}` ({d.action}): {d.reason}" for d in p.dropped] + [""]
+    if p.summary:
+        lines += ["## Model summary", "", _one_line(p.summary), ""]
+    if notes:
+        lines += ["## Notes", ""] + [f"- {n}" for n in notes] + [""]
+    lines += ["## Reviewer checks", "",
+              "- [ ] Every TSD clause in scope has a scenario, or an open question",
+              "- [ ] Each expected result matches the TSD (or a clarification it cites)",
+              "- [ ] Each target file is the right place for the scenario", ""]
+    return "\n".join(lines)
+
+
+def _coverage_lines(plan: TestPlan, p: Proposal) -> list[str]:
+    done = {pi for c in p.changes for pi in c.plan_items}
+    dropped_paths = {d.path for d in p.dropped}
+    lines = [f"## Plan coverage ({plan.id})", "", "| Item | Scenario | File | Status |", "| --- | --- | --- | --- |"]
+    for i in plan.items:
+        status = ("implemented" if i.id in done else "dropped by ATH" if i.path in dropped_paths
+                  else "**not implemented**")
+        lines.append(f"| {i.id} | {_one_line(i.scenario).replace('|', '/')} | `{i.path}` | {status} |")
+    return lines + [""]
+
+
+def render_checklist(p: Proposal, rendered: list[tuple[AcceptedChange, str, str]], notes: list[str],
+                     plan: TestPlan | None = None) -> str:
     lines = [f"# Test authoring checklist: {p.id}", "",
              f"Product `{p.product}` · source `{p.source}` · model `{p.model or '(none)'}` · skill `{p.skill}`"
              + (f" · product skill v{p.product_skill_version}" if p.product_skill_version else ""), "",
              "Values from the test-data catalogue appear as `{{testdata:...}}` references; existing test data "
              "is shown masked.", ""]
+    if plan:
+        lines += _coverage_lines(plan, p)
     lines += [f"## Changes ({len(p.changes)})", ""]
     if not p.changes:
         lines += ["None.", ""]
@@ -510,6 +737,8 @@ def render_checklist(p: Proposal, rendered: list[tuple[AcceptedChange, str, str]
         lines.append(f"### {acc.action} `{acc.path}` ({acc.kind}, {acc.format})")
         trace = ", ".join(acc.clauses) + (" (traced by section title only)" if acc.traced_by == "title" else "")
         lines.append(f"- Clauses: {trace}")
+        if acc.plan_items:
+            lines.append(f"- Plan items: {', '.join(acc.plan_items)}")
         if acc.reason:
             lines.append(f"- Reason: {' '.join(acc.reason.split())}")
         if asserts := assertion_lines(old, new):
@@ -523,8 +752,9 @@ def render_checklist(p: Proposal, rendered: list[tuple[AcceptedChange, str, str]
         lines += [f"- `{d.path}` ({d.action}): {d.reason}" for d in p.dropped] + [""]
     if p.spec_questions:
         lines += ["## Spec questions", ""]
-        lines += [f"- {('[' + q.clause + '] ') if q.clause else ''}{' '.join(q.question.split())}"
-                  for q in p.spec_questions] + [""]
+        lines += [_question_line(q) for q in p.spec_questions] + [""]
+    if plan and plan.clarifications:
+        lines += [f"## Clarifications ({len(plan.clarifications)})", ""] + _clarification_lines(plan.clarifications)
     if p.summary:
         lines += ["## Model summary", "", " ".join(p.summary.split()), ""]
     if notes:
@@ -533,8 +763,10 @@ def render_checklist(p: Proposal, rendered: list[tuple[AcceptedChange, str, str]
               "- [ ] Every expected value comes from the TSD, not from what the code does today",
               "- [ ] Each **Review** flag above is intended",
               "- [ ] Card, account, mobile and Aadhaar values are `{{testdata:...}}` references",
-              "- [ ] New tests call methods that exist (see the `code` block, if it was attached)", ""]
-    return "\n".join(lines)
+              "- [ ] New tests call methods that exist (see the `code` block, if it was attached)"]
+    if plan and plan.clarifications:
+        lines.append("- [ ] Each expectation resting on a clarification is confirmed by the TSD owner")
+    return "\n".join(lines + [""])
 
 
 # ---------------------------------------------------------------------------------------- storage
@@ -558,3 +790,146 @@ def load_proposal(folder: str | Path) -> Proposal:
     if p.hash != recorded:
         raise ValueError(f"{folder / 'proposal.json'} does not match its recorded hash; it changed after it was made")
     return p
+
+
+# ------------------------------------------------------------------------------- plan storage
+def plan_yaml(p: TestPlan, next_step: str = "") -> str:
+    """The editable plan: a tester removes, edits or adds items, then generates from it."""
+    head = [f"# Test plan {p.id} for {p.product}. Review plan.md, edit here if needed, then generate"
+            + (f":\n#   {next_step}" if next_step else "."),
+            "# Remove an item to leave it out; edit its scenario or expected result; add an item without an",
+            "# `id` to add one. Every item cites TSD clauses; `update` needs an existing test file.",
+            "# Fields: action (create|update), path, clauses, scenario, expected, clarifications (Q- ids)."]
+    items = [{"id": i.id, "action": i.action, "path": i.path, "clauses": i.clauses, "scenario": i.scenario,
+              "expected": i.expected, **({"clarifications": i.clarifications} if i.clarifications else {})}
+             for i in p.items]
+    body = yaml.safe_dump({"plan": p.id, "plan_sha256": p.hash, "items": items}, sort_keys=False,
+                          allow_unicode=True, width=100)
+    return "\n".join(head) + "\n" + body
+
+
+def answer_sheet(p: TestPlan, next_step: str = "", answers: dict[str, str] | None = None) -> str:
+    """answers.yaml for the plan's open questions; `answers` pre-fills it (a record of typed answers)."""
+    head = [f"# Spec questions of test plan {p.id}. For each question, write `answer`:",
+            "#   your answer as text, `accept` to take the model's assumption, or leave it empty to skip.",
+            "# Answers refine the clause they cite; they do not change the TSD. Then plan again"
+            + (f":\n#   {next_step}" if next_step else ".")]
+    rows = [{"id": q.id, "clause": q.clause, "question": q.question, "assumption": q.assumption,
+             "answer": (answers or {}).get(q.id, "")} for q in p.spec_questions]
+    return "\n".join(head) + "\n" + yaml.safe_dump({"plan": p.id, "plan_sha256": p.hash, "answers": rows},
+                                                   sort_keys=False, allow_unicode=True, width=100)
+
+
+def save_plan(folder: str | Path, drafted: DraftedPlan, next_steps: tuple[str, str] = ("", "")) -> str:
+    """Write plan.json (canonical), plan.sha256, plan.md, plan.yaml and, with open questions,
+    answers.yaml. `next_steps`: the commands to put in plan.yaml and answers.yaml. Returns the hash."""
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    p = drafted.plan
+    (folder / "plan.json").write_text(p.canonical_json(), encoding="utf-8")
+    (folder / "plan.sha256").write_text(p.hash + "\n", encoding="utf-8")
+    (folder / "plan.md").write_text(drafted.markdown, encoding="utf-8")
+    (folder / "plan.yaml").write_text(plan_yaml(p, next_steps[0]), encoding="utf-8")
+    if p.spec_questions:
+        (folder / "answers.yaml").write_text(answer_sheet(p, next_steps[1]), encoding="utf-8")
+    return p.hash
+
+
+def load_plan(folder: str | Path) -> TestPlan:
+    """Load a stored plan and check it against its recorded hash. Raises ValueError when they differ."""
+    folder = Path(folder)
+    p = TestPlan.model_validate_json((folder / "plan.json").read_text(encoding="utf-8"))
+    recorded = (folder / "plan.sha256").read_text(encoding="utf-8").strip()
+    if p.hash != recorded:
+        raise ValueError(f"{folder / 'plan.json'} does not match its recorded hash; it changed after it was made")
+    return p
+
+
+def answers_from(entries: Any, plan: TestPlan, user: str, mask: Callable[[str], str]) -> list[Clarification]:
+    """Clarifications from `[{id, answer}]` for the plan's open questions, masked. Blank answers are
+    skipped (the question stays open). Raises ValueError for an unknown id or a bad entry."""
+    if not isinstance(entries, list):
+        raise ValueError("answers must be a list of {id, answer}")
+    by_id = {q.id: q for q in plan.spec_questions}
+    out: list[Clarification] = []
+    for e in entries:
+        if not isinstance(e, dict) or not isinstance(e.get("id"), str):
+            raise ValueError("each answer needs an `id` (Q-n) and an `answer`")
+        q = by_id.get(e["id"])
+        if q is None:
+            raise ValueError(f"{e['id']} is not an open question of plan {plan.id} "
+                             f"(open: {', '.join(by_id) or 'none'})")
+        if any(c.id == q.id for c in out):
+            raise ValueError(f"{q.id} is answered twice")
+        text = str(e.get("answer") if e.get("answer") is not None else "").strip()
+        if not text:
+            continue
+        accepted = text.lower() in ACCEPT
+        if accepted:
+            if not q.assumption:
+                raise ValueError(f"{q.id} has no assumption to accept; write an answer")
+            text = q.assumption
+        out.append(Clarification(id=q.id, clause=q.clause, question=q.question, answer=mask(text),
+                                 accepted_assumption=accepted, by=user))
+    return out
+
+
+def load_answers(text: str, plan: TestPlan, user: str, mask: Callable[[str], str]) -> list[Clarification]:
+    """Clarifications from an answers.yaml. Raises ValueError for a sheet that cannot be used."""
+    try:
+        data = yaml.safe_load(text) or {}
+    except yaml.YAMLError as e:
+        raise ValueError(f"answers file is not valid YAML: {e}") from None
+    if not isinstance(data, dict) or "answers" not in data:
+        raise ValueError("answers file needs an `answers:` list")
+    return answers_from(data["answers"], plan, user, mask)
+
+
+def apply_plan_edits(plan: TestPlan, text: str, ws: Workspace, user: str, new_id: str) -> TestPlan | None:
+    """A new plan version from a tester's plan.yaml, or None when it changes nothing. Items keep their
+    id, are marked `edited` when changed and `origin: tester` when added; every item passes the same
+    checks as a planned one. No model call. Raises ValueError for an edit that cannot be used."""
+    try:
+        data = yaml.safe_load(text) or {}
+    except yaml.YAMLError as e:
+        raise ValueError(f"plan file is not valid YAML: {e}") from None
+    raw = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        raise ValueError("plan file needs an `items:` list")
+    by_id = {i.id: i for i in plan.items}
+    ids, titles = set(plan.clause_ids), {t.casefold(): t for t in plan.section_titles}
+    answered = {c.id for c in plan.clarifications}
+    n = _max_num(set(by_id), "TP")
+    items: list[PlanItem] = []
+    for k, entry in enumerate(raw, 1):
+        where = f"plan item {entry.get('id') or '#' + str(k)}" if isinstance(entry, dict) else f"plan item #{k}"
+        try:
+            old_id = entry.get("id") if isinstance(entry, dict) else None
+            orig = by_id.get(str(old_id)) if old_id else None
+            if old_id and orig is None:
+                raise ValueError(f"unknown id {old_id}; leave `id` out to add an item")
+            item = plan_item(entry)
+            item.scenario, item.expected = ws.masker.mask(item.scenario), ws.masker.mask(item.expected)
+            if orig is not None:
+                if any(i.id == orig.id for i in items):
+                    raise ValueError("listed twice")
+                same = all(getattr(item, f) == getattr(orig, f) for f in
+                           ("action", "path", "clauses", "scenario", "expected", "clarifications"))
+                if same:
+                    items.append(orig)
+                    continue
+                item.id, item.origin, item.edited = orig.id, orig.origin, True
+            else:
+                n += 1
+                item.id, item.origin = f"TP-{n}", "tester"
+            if len(items) >= ws.ta.limits.plan_items:
+                raise GuardError(f"over the limit of {ws.ta.limits.plan_items} plan items")
+            item.traced_by = _trace(item.clauses, ids, titles)
+            item.kind = ws.check_plan_item(item, None, answered).kind
+        except (ValueError, GuardError) as e:
+            raise ValueError(f"{where}: {e}") from None
+        items.append(item)
+    if items == plan.items:
+        return None
+    return plan.model_copy(update={"id": new_id, "parent": plan.id, "created_at": utcnow(), "items": items,
+                                   "edited_by": user, "agent_call": {}, "prompt_sha256": ""}, deep=True)

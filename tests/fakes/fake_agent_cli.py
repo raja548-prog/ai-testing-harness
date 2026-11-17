@@ -19,7 +19,9 @@ Behaviour is chosen by $FAKE_AGENT_MODE, which the test passes through `passEnv`
   hang     hangs unless resumed with -r; the resumed call answers (and reports its session id)
   silent   prints nothing for 3 s, then answers
   drip     prints a line every 0.3 s for 1.5 s, then answers
-  author   T3: chatter, then the JSON answer read from the file $FAKE_AUTHOR_OUTPUT
+  author   T3: chatter, then the JSON answer read from the file $FAKE_AUTHOR_OUTPUT; for the plan
+           skill (t03-plan) read from $FAKE_PLAN_OUTPUT instead. A file holding a JSON list gives one
+           answer per call, in order (the last one repeats), counted in <file>.calls
   author-invalid  T3: the schema's keys, but `changes` is not a list
 The `quote` is the first log line, else the failure message, copied from the prompt.
 With $FAKE_AGENT_RECORD set to a folder, every call writes its prompt there as call-<n>.txt.
@@ -53,8 +55,16 @@ if os.environ.get("FAKE_AGENT_RECORD"):
 
 if mode in ("author", "author-invalid"):
     if mode == "author":
-        with open(os.environ["FAKE_AUTHOR_OUTPUT"], encoding="utf-8") as f:
+        source = os.environ["FAKE_PLAN_OUTPUT" if "# T3 test plan" in prompt else "FAKE_AUTHOR_OUTPUT"]
+        with open(source, encoding="utf-8") as f:
             answer = f.read()
+        if answer.lstrip().startswith("["):  # a sequence: one answer per call
+            counter = source + ".calls"
+            n = int(open(counter).read()) if os.path.exists(counter) else 0
+            with open(counter, "w") as f:
+                f.write(str(n + 1))
+            seq = json.loads(answer)
+            answer = json.dumps(seq[min(n, len(seq) - 1)])
     else:
         answer = json.dumps({"changes": "none", "spec_questions": [], "summary": ""})
     text = "Reading the TSD and the tests...\n```json\n" + answer + "\n```"

@@ -25,12 +25,18 @@ def _code(value: str) -> str:
 
 
 def render_authoring(a: dict[str, Any]) -> list[str]:
-    """The "Test authoring (T3)" section: applied and dropped changes, review flags, spec questions."""
+    """The "Test authoring (T3)" section: the test plan and its coverage, clarifications, applied and
+    dropped changes, review flags, spec questions."""
     lines = ["", "### Test authoring (T3)", ""]
-    p = a.get("proposal")
-    if a.get("status") == "skipped" and p is None:
+    p, plan = a.get("proposal"), a.get("plan")
+    if a.get("status") == "skipped" and p is None and plan is None:
         return lines + [f"Skipped: {_text(a.get('reason') or 'not run')}"]
     applied = set(a.get("applied") or [])
+    if plan is not None:
+        lines += _plan_lines(plan, p, a.get("plan_approved_by"))
+        if p is None:
+            return lines + ([f"Status: {_text(a.get('reason') or a.get('status', ''))}"] if a.get("reason") else [])
+        lines.append("")
     if p is None:
         return lines + [f"Status: {_text(a.get('status', ''))}"]
     state = (f"applied, approved by {_text(a['approved_by'])}" if a.get("approved_by")
@@ -48,7 +54,35 @@ def render_authoring(a: dict[str, Any]) -> list[str]:
         lines += [f"| {_code(d.path)} | {_text(d.reason, 200)} |" for d in p.dropped]
     if p.spec_questions:
         lines += ["", "Spec questions:"]
-        lines += [f"- {_text(('[' + q.clause + '] ') if q.clause else '')}{_text(q.question, 300)}" for q in p.spec_questions]
+        lines += [_question(q) for q in p.spec_questions]
+    return lines
+
+
+def _question(q: Any) -> str:
+    head = f"{_text(q.id)} " if getattr(q, "id", "") else ""
+    line = f"- {head}{_text(('[' + q.clause + '] ') if q.clause else '')}{_text(q.question, 300)}"
+    return line + (f" (assumption: {_text(q.assumption, 200)})" if getattr(q, "assumption", "") else "")
+
+
+def _plan_lines(plan: Any, p: Any, approved_by: str | None) -> list[str]:
+    state = f"approved by {_text(approved_by)}" if approved_by else "waiting for approval"
+    lines = [f"Test plan {_code(plan.hash[:12])} · round {plan.round} · {len(plan.items)} item(s), "
+             f"{len(plan.spec_questions)} open question(s), {len(plan.clarifications)} clarification(s) · {state}"]
+    if plan.items:
+        done = {pi for c in p.changes for pi in c.plan_items} if p else set()
+        lines += ["", "| Item | Clauses | Scenario | File | Status |", "| --- | --- | --- | --- | --- |"]
+        for i in plan.items:
+            status = ("implemented" if i.id in done else "not implemented") if p else "planned"
+            notes = (" (tester answer)" if i.clarifications else "") + (
+                " (added by tester)" if i.origin == "tester" else " (edited by tester)" if i.edited else "")
+            lines.append(f"| {_text(i.id)} | {_text(', '.join(i.clauses))} | {_text(i.scenario, 160)}{notes} | "
+                         f"{_code(i.path)} | {status} |")
+    if plan.spec_questions:
+        lines += ["", "Open spec questions:"] + [_question(q) for q in plan.spec_questions]
+    if plan.clarifications:
+        lines += ["", "Clarifications (tester answers, not in the signed-off TSD):"]
+        lines += [f"- {_text(c.id)} {_text(('[' + c.clause + '] ') if c.clause else '')}{_text(c.question, 200)} "
+                  f"→ {_text(c.answer, 300)} ({_text(c.by)})" for c in plan.clarifications]
     return lines
 
 
