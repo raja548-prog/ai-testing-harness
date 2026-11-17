@@ -74,3 +74,13 @@ def test_log_source_keys_must_be_a_list():
 def test_selection_default_cannot_be_empty():
     with pytest.raises(ValidationError, match="default"):
         _validate(lambda d: d["selection"].update(default=[]))
+
+
+def test_not_pii_names_only_id_fields():
+    def set_not_pii(value):
+        return lambda d: d["testAuthoring"].__setitem__("notPii", value)
+    assert _validate(set_not_pii("txnRefNo")).test_authoring.not_pii == ["txnRefNo"]
+    assert _validate(set_not_pii([" settlementId "])).test_authoring.not_pii == ["settlementId"]
+    for bad in (["pan"], ["cardNumber"], ["debit_card_no"], ["customerMobile"], ["aadhaar_no"], ["pinBlock"], [" "]):
+        with pytest.raises(ValidationError, match="notPii"):
+            _validate(set_not_pii(bad))

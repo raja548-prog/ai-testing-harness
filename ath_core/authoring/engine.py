@@ -81,8 +81,25 @@ class AuthorInputs:
 
 def authoring_masker(profile: TestProfile) -> Masker:
     """Every category, whatever the profile's `logs.masking` says: test files are not logs, and a
-    category switched off for logs must not let raw test data reach the model."""
-    return Masker(categories=list(CATEGORIES), correlation_keys=profile.correlation_keys())
+    category switched off for logs must not let raw test data reach the model. `testAuthoring.notPii`
+    fields are exempt as the Masker docstring says."""
+    ta = profile.test_authoring
+    return Masker(categories=list(CATEGORIES), correlation_keys=profile.correlation_keys(),
+                  not_pii_keys=list(ta.not_pii) if ta else [])
+
+
+def _not_pii_cells(text: str, fmt: str, names: list[str]) -> set[str]:
+    """The cell values in a CSV/TSV's `testAuthoring.notPii` columns (header names, any case).
+    Empty when nothing is declared or the text does not parse, so masking stays on."""
+    if not names or fmt not in ("csv", "tsv"):
+        return set()
+    try:
+        layout = read_csv(text, fmt)
+    except (GuardError, ValueError):
+        return set()
+    wanted = {n.lower() for n in names}
+    cols = [i for i, h in enumerate(layout.header) if h.strip().lower() in wanted]
+    return {v for _, _, row in layout.data_records() for i in cols if i < len(row) for v in (row[i], row[i].strip())}
 
 
 @dataclass
@@ -117,6 +134,8 @@ class Workspace:
         if not self.root.is_dir():
             raise ValueError(f"test checkout {tests_dir} is not a folder")
         self.masker = authoring_masker(profile)
+        # for what the model writes: no correlation-key exemption, but declared not-PII fields are exempt
+        self._written_masker = Masker(categories=list(CATEGORIES), not_pii_keys=list(self.ta.not_pii))
         self.catalogue: Catalogue = load_catalogue(self.root / self.ta.test_data) if self.ta.test_data else Catalogue()
         self._views: dict[str, FileView | None] = {}
         self._files: list[str] | None = None
@@ -157,19 +176,21 @@ class Workspace:
             if tf is None:
                 self._views[rel] = None
             else:
-                masked, spans = self.masker.mask_spans(tf.text)
+                exempt = _not_pii_cells(tf.text, source.edit_format, self.ta.not_pii)
+                masked, spans = self.masker.mask_spans(tf.text, exempt_values=exempt)
                 self._views[rel] = FileView(rel, source.kind, source.edit_format, tf, masked, spans,
                                             sha256_bytes(data), source.key_column)
         return self._views[rel]
 
-    def check_written(self, text: str) -> None:
-        """Text the model wrote: no mask tokens, only known catalogue references, nothing Masker would mask."""
+    def check_written(self, text: str, exempt_values: set[str] | frozenset[str] = frozenset()) -> None:
+        """Text the model wrote: no mask tokens, only known catalogue references, nothing Masker would mask.
+        `exempt_values`: whole values declared not PII (cells of a `notPii` column)."""
         if m := MASK_TOKEN_RE.search(text):
             raise GuardError(f"model wrote the mask token {m.group(0)}; mask tokens are redacted values, "
                              f"never literals: use a testData reference")
         if bad := self.catalogue.unknown_refs(text):
             raise GuardError(f"unknown test-data reference(s) {bad}")
-        masked, spans = Masker(categories=list(CATEGORIES)).mask_spans(text)
+        masked, spans = self._written_masker.mask_spans(text, exempt_values=exempt_values)
         if spans:
             found = []
             for s in spans:
@@ -178,11 +199,21 @@ class Workspace:
             raise GuardError(f"model wrote a value that looks like {', '.join(dict.fromkeys(found))}; "
                              f"use a testData reference or another value")
 
-    def _written_parts(self, change: Change | AcceptedChange) -> list[str]:
-        parts = [change.content or ""]
+    def _written_parts(self, change: Change | AcceptedChange, source: TestSource) -> list[tuple[str, set[str]]]:
+        """Every piece of text the model wrote, with the whole values in it that are declared not PII."""
+        names = {n.lower() for n in self.ta.not_pii}
+        fmt = source.edit_format
+
+        def cell(column: str | None, value: str) -> tuple[str, set[str]]:
+            return value, ({value, value.strip()} if column and column.strip().lower() in names else set())
+
+        content = change.content or ""
+        parts = [(content, _not_pii_cells(content, fmt, self.ta.not_pii))]
         for e in change.edits:
             # `key` too: it is stored in the proposal, so it must not carry a raw value either
-            parts += [e.replace or "", e.key or "", *(e.values or {}).values(), *(e.set or {}).values()]
+            parts += [(e.replace or "", set()), cell(source.key_column, e.key or "")]
+            parts += [cell(c, v) for c, v in (e.values or {}).items()]
+            parts += [cell(c, v) for c, v in (e.set or {}).items()]
         return parts
 
     def _sibling_layout(self, target: Path, rel: str, source: TestSource):
@@ -203,11 +234,11 @@ class Workspace:
         (None skips that check, at apply time, where the base-file hash already pins the file)."""
         target, source = self.check_path(change.path)
         fmt = source.edit_format
-        parts = self._written_parts(change)
-        if sum(len(p) for p in parts) > self.ta.limits.max_change_chars:
+        parts = self._written_parts(change, source)
+        if sum(len(p) for p, _ in parts) > self.ta.limits.max_change_chars:
             raise GuardError(f"change is over the limit of {self.ta.limits.max_change_chars} characters")
-        for text in parts:
-            self.check_written(text)
+        for text, exempt in parts:
+            self.check_written(text, exempt)
         fill = self.catalogue.fill
         if change.action == "create":
             if target.exists() or target.is_symlink():

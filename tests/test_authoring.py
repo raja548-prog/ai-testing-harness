@@ -414,6 +414,58 @@ def test_new_csv_must_copy_a_sibling_header(profile, checkout):
     assert "needs a sibling" in dropped(drafted)[lonely["path"]]
 
 
+# 21-digit transaction IDs starting 13-19: masked as a length prefix + card number unless declared notPii.
+TXN_1, TXN_2, TXN_3 = "137856669422055619592", "193508406195205395863", "131485119953844126372"
+TXN_CSV = f"test_id,txnRefNo,amount,expected_fee\nFEE-001,{TXN_1},1000.00,12.50\nFEE-002,{TXN_2},250.00,3.13\n"
+
+
+@pytest.fixture
+def txn_checkout(checkout):
+    (checkout / FEES).write_text(TXN_CSV)
+    git(checkout, "commit", "-qam", "transaction ids")
+    return checkout
+
+
+def test_not_pii_csv_column_is_shown_and_editable(tmp_path, txn_checkout):
+    prof = load_profile(profile_with(tmp_path, notPii=["txnrefno"]))  # header match ignores case
+    view = Workspace(prof, txn_checkout).view(FEES)
+    assert view.masked == TXN_CSV and view.spans == []
+    drafted, _ = propose(prof, txn_checkout, answer(csv_change(
+        {"op": "update_row", "key": "FEE-001", "set": {"amount": "1001.00"}},
+        {"op": "add_row", "values": {"test_id": "FEE-003", "txnRefNo": TXN_3, "amount": "7", "expected_fee": "0.09"}})))
+    assert drafted.proposal.changes, dropped(drafted)
+    apply(prof, txn_checkout, drafted.proposal)
+    text = (txn_checkout / FEES).read_text()
+    assert f"FEE-001,{TXN_1},1001.00" in text and f"FEE-003,{TXN_3},7" in text
+
+
+def test_undeclared_long_ids_are_still_masked_and_refused(profile, txn_checkout):
+    assert "[PAN****" in Workspace(profile, txn_checkout).view(FEES).masked
+    drafted, _ = propose(profile, txn_checkout, answer(csv_change(
+        {"op": "add_row", "values": {"test_id": "FEE-003", "txnRefNo": TXN_3, "amount": "7"}})))
+    assert "looks like a card number" in dropped(drafted)[FEES]
+
+
+def test_not_pii_column_never_lets_a_card_number_through(tmp_path, txn_checkout):
+    prof = load_profile(profile_with(tmp_path, notPii=["txnRefNo"]))
+    (txn_checkout / FEES).write_text(TXN_CSV + "FEE-009,4111111111111111,1.00,0.01\n")
+    git(txn_checkout, "commit", "-qam", "a card number in the id column")
+    assert "[PAN****1111]" in Workspace(prof, txn_checkout).view(FEES).masked
+    drafted, _ = propose(prof, txn_checkout, answer(csv_change(
+        {"op": "add_row", "values": {"test_id": "FEE-003", "txnRefNo": "5500005555555559", "amount": "7"}})))
+    assert "looks like a card number" in dropped(drafted)[FEES]
+    assert "5500005555555559" not in drafted.proposal.canonical_json()
+
+
+def test_not_pii_key_in_code_edits(tmp_path, checkout):
+    line = f'        req.setTxnRefNo("{TXN_1}");\n'
+    change = {**UPDATE, "edits": [{"find": ASSERT_LINE, "replace": ASSERT_LINE + line}]}
+    drafted, _ = propose(load_profile(profile_with(tmp_path, notPii=["txnRefNo"])), checkout, answer(change))
+    assert drafted.proposal.changes, dropped(drafted)
+    drafted, _ = propose(load_profile(LOCAL_PROFILE), checkout, answer(change))
+    assert "looks like a card number" in dropped(drafted)[JAVA_TEST]
+
+
 # ------------------------------------------------------------------------------------- json, yaml
 def test_json_edit_that_breaks_parsing_is_dropped(profile, checkout):
     change = {"action": "update", "path": "scenarios/refund.json", "clauses": ["AC-8"],

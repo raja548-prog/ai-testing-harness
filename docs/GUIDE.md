@@ -313,12 +313,28 @@ testAuthoring:
   testData: testdata/catalogue.yaml   # relative to the test checkout
   codeContext: ["src/main/java/**/clearing/**/*.java"]   # relative to --code; default: the product skill's module paths
   templates: "simulator/templates/**/*.yaml"              # simulator products only
+  notPii: [txnRefNo, settlementId]   # ID fields / CSV columns that hold no personal data (see below)
   limits: { maxChanges: 20, testFiles: 15, testsChars: 40000, maxRounds: 3 }   # optional caps
 ```
 
 `sources` is required for `local-fs`. `kind: code` files are edited by find/replace; `kind: data` files
 by format: CSV/TSV by row operations (`add_row`, and `update_row` on the `keyColumn`), JSON/YAML by
 find/replace that must still parse. Nothing outside these globs can be changed: no source, build or CI files.
+
+**`notPii`: IDs that look like card numbers.** T3 masks every category in test files. Some IDs are
+masked by mistake: a 21-digit transaction ID that starts with 13–19 can be read as an ISO 8583 length
+prefix followed by a Luhn-valid card number (about 1 in 10 such IDs). It then shows as `13[PAN****2055]619592`,
+edits that touch it are dropped with "edit touches masked data", and the model can't write one. List
+such fields in `notPii`:
+
+- **Code, JSON, YAML:** a value written directly as the field's value (`txnRefNo=…`, `"txnRefNo": "…"`,
+  `txnRefNo: …`, `setTxnRefNo("…")`, `.txnRefNo("…")`, `<txnRefNo>…`) skips the length-prefix card-number
+  rule and the Aadhaar and mobile rules.
+- **CSV/TSV:** the same holds for the cells of a column with that header (any case).
+- **Still masked:** a value that is itself a valid 13–19 digit card number, plus track 2, CVV and PIN
+  blocks. Names that look like card or personal-data fields (`pan`, `card…`, `cvv`, `pin…`, `aadhaar…`,
+  `mobile…`, `phone…`, `msisdn`) are refused. Because of this, a postal `pinCode` can't be listed.
+- `notPii` applies to T3 only. Log masking doesn't change.
 
 The test-data catalogue is the only place card, account, mobile and Aadhaar values come from. The model
 sees names, kinds, descriptions and field names, never values, and writes `{{testdata:visa-credit-01.pan}}`;

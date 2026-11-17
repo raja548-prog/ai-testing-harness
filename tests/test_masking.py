@@ -93,3 +93,51 @@ def test_categories_are_normalised_and_checked():
     assert Masker(categories=[" PAN "]).mask("4111111111111111") == "[PAN****1111]"
     with pytest.raises(ValueError, match="unknown masking categories"):
         Masker(categories=["pna"])
+
+
+# A 21-digit ID starting 13-19 can be read as an ISO 8583 length prefix + a Luhn-valid PAN by chance.
+TXN_ID = "137856669422055619592"
+
+
+def test_long_ids_can_be_mistaken_for_a_length_prefixed_pan():
+    assert Masker().mask(f"txnRefNo={TXN_ID}") == "txnRefNo=13[PAN****2055]619592"
+
+
+@pytest.mark.parametrize("text", [
+    f"txnRefNo={TXN_ID}", f'"txnRefNo": "{TXN_ID}"', f"txnRefNo: {TXN_ID}", f"TXNREFNO = '{TXN_ID}'",
+    f'.txnRefNo("{TXN_ID}")', f'req.setTxnRefNo("{TXN_ID}");', f"withTxnRefNo({TXN_ID})",
+    f"<txnRefNo>{TXN_ID}</txnRefNo>",
+])
+def test_declared_not_pii_key_values_are_not_masked(text):
+    m = Masker(not_pii_keys=["txnRefNo"])
+    assert m.mask(text) == text
+    assert m.mask_spans(text) == (text, [])
+
+
+def test_not_pii_keys_exempt_only_their_direct_values():
+    m = Masker(not_pii_keys=["txnRefNo"])
+    assert "[PAN****" in m.mask(f"orderId={TXN_ID}")  # not declared
+    assert "[PAN****" in m.mask(f"txnRefNo=1 then {TXN_ID}")  # not directly the key's value
+    assert "[PAN****" in m.mask(f"mytxnRefNo={TXN_ID}")  # a longer name
+    assert "[PAN****" in m.mask("DE002=164111111111111111")  # the length-prefix rule still works elsewhere
+
+
+def test_not_pii_keys_never_exempt_card_numbers_or_keyed_card_data():
+    m = Masker(not_pii_keys=["txnRefNo"])
+    assert m.mask("txnRefNo=4111111111111111") == "txnRefNo=[PAN****1111]"
+    assert m.mask("txnRefNo=4111 1111 1111 1111") == "txnRefNo=[PAN****1111]"
+    assert "[TRACK2]" in m.mask("txnRefNo=;4111111111111111=29121011234?")
+
+
+def test_not_pii_keys_exempt_aadhaar_and_mobile_shapes():
+    m = Masker(not_pii_keys=["batchRef"])
+    assert m.mask("batchRef=234567890124 batchRef: 9876543210") == "batchRef=234567890124 batchRef: 9876543210"
+    assert m.mask("aadhaar=234567890124 mobile 9876543210") == "aadhaar=[AADHAAR] mobile [MOBILE]"
+
+
+def test_exempt_values_match_whole_values_only_and_last_one_call():
+    m = Masker()
+    assert m.mask(f"{TXN_ID},x", exempt_values={TXN_ID}) == f"{TXN_ID},x"
+    assert "[PAN****" in m.mask(f"{TXN_ID},x", exempt_values={TXN_ID[:20]})
+    assert "[PAN****" in m.mask(f"{TXN_ID},x")  # the exemption does not outlive the call
+    assert m.mask("4111111111111111", exempt_values={"4111111111111111"}) == "[PAN****1111]"

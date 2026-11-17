@@ -48,6 +48,7 @@ testAuthoring:                                       # T3: create or update test
   # testData: <testdata/catalogue.yaml>             # approved test cards, accounts, mobiles, Aadhaar numbers
   # codeContext: ["<src/main/java/**/*.java>"]       # relative to --code; default: the product skill's module paths
   # templates: "<simulator/templates/**/*.yaml>"     # only for products with simulator scenarios
+  # notPii: [<txnRefNo>]                            # ID fields / CSV columns masked by mistake as card numbers
 
 logs:
   sources:

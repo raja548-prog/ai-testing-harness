@@ -92,7 +92,10 @@ The model sees masked text. The files on disk are not masked. Two things follow.
 
 **False positives.** The masking regexes also hit ordinary test literals. `_MOBILE_RE` has no
 checksum, so any 10-digit number starting 6–9 becomes `[MOBILE]`. About 1 in 10 random
-13–19 digit numbers (for example millisecond timestamps) pass Luhn and become `[PAN…]`. So:
+13–19 digit numbers (for example millisecond timestamps) pass Luhn and become `[PAN…]`. Longer IDs
+are hit too: a 21-digit ID starting 13–19 is read as an ISO 8583 length prefix plus a PAN, and about
+1 in 10 pass Luhn. `testAuthoring.notPii` lists the ID fields and CSV columns that are exempt from that
+rule and from the Aadhaar and mobile rules. A full 13–19 digit PAN in those fields is still masked. So:
 - The skill tells the model that mask tokens in the input are redacted values. They are not
   literals to copy, and it must not write them.
 - The output check reports hits per category and shows the masked token, for example "model

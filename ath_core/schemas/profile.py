@@ -5,6 +5,7 @@ contains scripts. The core validates it before any run starts.
 """
 from __future__ import annotations
 
+import re
 from datetime import date
 from pathlib import Path
 from typing import Any, Literal
@@ -15,6 +16,9 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator,
 from ath_core.masking import CATEGORIES as MASK_CATEGORIES
 
 SUPPORTED_API_VERSIONS = {"ainxt.io/test-profile/v1"}
+# Names testAuthoring.notPii refuses (matched with _, - and spaces removed).
+_PII_NAME = re.compile(r"(?i)^(?:pan|card.*|.*cardn(?:o|um(?:ber)?)|cvv\d?|cvc\d?|cid|track2?|pin.*|"
+                       r"aadha+r.*|mobile.*|phone.*|msisdn|.*mobile(?:no|num(?:ber)?)?|.*phone(?:no|num(?:ber)?)?)$")
 
 
 class _Model(BaseModel):
@@ -149,11 +153,25 @@ class TestAuthoring(_Model):
     code_context: list[str] = Field(default_factory=list, alias="codeContext")
     templates: list[str] = Field(default_factory=list)                  # simulator template globs
     limits: AuthoringLimits = Field(default_factory=AuthoringLimits)
+    # Field / CSV column names whose values are IDs, not personal data (e.g. a 21-digit txnRefNo that
+    # would otherwise be read as a length prefix + card number). A real card number there is still masked.
+    not_pii: list[str] = Field(default_factory=list, alias="notPii")
 
-    @field_validator("templates", "code_context", mode="before")
+    @field_validator("templates", "code_context", "not_pii", mode="before")
     @classmethod
     def _one_or_many(cls, v: Any) -> Any:
         return [v] if isinstance(v, str) else v
+
+    @field_validator("not_pii")
+    @classmethod
+    def _ids_only(cls, v: list[str]) -> list[str]:
+        v = [k.strip() for k in v]
+        if any(not k for k in v):
+            raise ValueError("testAuthoring.notPii names must not be blank")
+        # A field that holds card or personal data must never be declared not PII.
+        if bad := [k for k in v if _PII_NAME.match(re.sub(r"[_\-\s]", "", k))]:
+            raise ValueError(f"testAuthoring.notPii {bad} name card or personal data; list only ID fields")
+        return v
 
     @model_validator(mode="after")
     def _sources_for_local_fs(self) -> "TestAuthoring":

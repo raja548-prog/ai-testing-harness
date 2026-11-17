@@ -69,6 +69,7 @@ testAuthoring:            # T3: create or update tests from the TSD
   #   - { kind: data, format: json, paths: ["scenarios/**/*.json"] }
   #   - { kind: data, format: yaml, paths: ["scenarios/**/*.yaml"] }
   # testData: testdata/catalogue.yaml   # approved test cards, accounts, mobiles, Aadhaar numbers
+  # notPii: [txnRefNo]                  # ID fields / CSV columns masked by mistake as card numbers
   codeContext: ["src/main/java/**/clearing/**/*.java", "src/main/java/**/model/**/*.java"]   # relative to --code
 
 logs:

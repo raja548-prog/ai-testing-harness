@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Callable, NamedTuple
+from typing import Callable, Collection, NamedTuple
 
 # Runs of 13+ digits, optionally separated by single spaces or dashes. Which part of a run is the PAN is
 # decided in _pan, so a PAN followed by an expiry or amount, or behind a length prefix, is still found.
@@ -123,9 +123,16 @@ class Masker:
     `correlation_keys` (the product's declared keys, e.g. rrn, stan) exempt only the Aadhaar rule
     for a number written directly as that key's value (`rrn=…`, `rrn: …`, `"rrn": "…"`): RRNs are
     12 digits and about 1 in 10 pass the Verhoeff check by chance. Every other rule still applies.
+
+    `not_pii_keys` (a profile's declared ID fields, e.g. txnRefNo) and the `exempt_values` of one
+    call (e.g. the cells of a CSV column declared not PII) go further: such a value skips the Aadhaar
+    and mobile rules and the PAN length-prefix fallback, so a 21-digit ID starting 13-19 is not read
+    as a length and a card number. A value that is itself a Luhn-valid 13-19 digit PAN is still
+    masked, and track 2, CVV and PIN block masking still apply.
     """
     categories: list[str] = field(default_factory=lambda: list(CATEGORIES))
     correlation_keys: list[str] = field(default_factory=list)
+    not_pii_keys: list[str] = field(default_factory=list)
     hits: dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -134,6 +141,17 @@ class Masker:
             raise ValueError(f"unknown masking categories {unknown}; known: {list(CATEGORIES)}")
         keys = "|".join(re.escape(k) for k in self.correlation_keys if k)
         self._key_value = re.compile(rf"(?i)\b(?:{keys})[\"']?\s*[:=]\s*[\"']?$") if keys else None
+        ids = "|".join(re.escape(k) for k in self.not_pii_keys if k)
+        # txnRefNo=…, "txnRefNo": "…", txnRefNo: …, .txnRefNo("…"), setTxnRefNo("…"), withTxnRefNo(…), <txnRefNo>…
+        self._not_pii = re.compile(rf"(?i)(?:\b|(?<=set)|(?<=with))(?:{ids})"
+                                   rf"(?:[\"']?\s*[:=]|\s*\(|>)\s*[\"']?$") if ids else None
+        self._exempt_values: frozenset[str] = frozenset()
+
+    def _exempt(self, m: re.Match[str]) -> bool:
+        """The match is a declared not-PII value: a not-PII key's direct value, or an exempt value."""
+        if m.group(0) in self._exempt_values:
+            return True
+        return bool(self._not_pii and self._not_pii.search(m.string[max(0, m.start() - 40):m.start()]))
 
     def _count(self, cat: str) -> None:
         self.hits[cat] = self.hits.get(cat, 0) + 1
@@ -143,21 +161,37 @@ class Masker:
             return m.group(0)  # e.g. an RRN: 12 digits, but not an Aadhaar number
         if self._key_value and self._key_value.search(m.string[max(0, m.start() - 40):m.start()]):
             return m.group(0)  # the value of a declared correlation key, e.g. rrn=…
+        if self._exempt(m):
+            return m.group(0)  # declared not PII
         self._count("aadhaar")
         return "[AADHAAR]"
 
-    def mask(self, text: str) -> str:
-        return self._run(text, None) if text else text
+    def _mobile(self, m: re.Match[str]) -> str:
+        if self._exempt(m):
+            return m.group(0)
+        self._count("mobile")
+        return "[MOBILE]"
 
-    def mask_spans(self, text: str) -> tuple[str, list[Span]]:
+    def mask(self, text: str, exempt_values: Collection[str] = ()) -> str:
+        """`exempt_values`: whole values declared not PII for this call (see the class docstring)."""
+        return self._run(text, None, exempt_values) if text else text
+
+    def mask_spans(self, text: str, exempt_values: Collection[str] = ()) -> tuple[str, list[Span]]:
         """Mask, and say where: each Span maps a masked region of the output back to the original.
 
         Regions are as tight as the replacement allows (`cvv=123` -> `cvv=***` covers only `123`).
         Text outside every span is copied unchanged, so a position there maps by a fixed offset."""
         spans: list[Span] = []
-        return (self._run(text, spans) if text else text), spans
+        return (self._run(text, spans, exempt_values) if text else text), spans
 
-    def _run(self, text: str, spans: list[Span] | None) -> str:
+    def _run(self, text: str, spans: list[Span] | None, exempt_values: Collection[str] = ()) -> str:
+        self._exempt_values = frozenset(v for v in exempt_values if v)
+        try:
+            return self._passes(text, spans)
+        finally:
+            self._exempt_values = frozenset()
+
+    def _passes(self, text: str, spans: list[Span] | None) -> str:
         cats = set(self.categories)
         passes: list[tuple[str, re.Pattern[str], Callable[[re.Match[str]], str]]] = []
         if "track2" in cats:
@@ -172,7 +206,7 @@ class Masker:
         if "aadhaar" in cats:
             passes.append(("aadhaar", _AADHAAR_RE, self._aadhaar))
         if "mobile" in cats:
-            passes.append(("mobile", _MOBILE_RE, lambda m: (self._count("mobile"), "[MOBILE]")[1]))
+            passes.append(("mobile", _MOBILE_RE, self._mobile))
         for cat, regex, fn in passes:
             if spans is None:
                 text = regex.sub(fn, text)
@@ -197,9 +231,10 @@ class Masker:
     def _pan(self, m: re.Match[str]) -> str:
         raw = m.group(0)
         groups = [(g.start(), g.end()) for g in _DIGIT_GROUP.finditer(raw)]
+        llvar = not self._exempt(m)  # a declared ID is never read as length prefix + PAN
         out, pos, i = [], 0, 0
         while i < len(groups):
-            found = self._pan_at(raw, groups, i)
+            found = self._pan_at(raw, groups, i, llvar)
             if found is None:
                 i += 1
                 continue
@@ -211,16 +246,18 @@ class Masker:
         return "".join(out) + raw[pos:]
 
     @staticmethod
-    def _pan_at(raw: str, groups: list[tuple[int, int]], i: int) -> tuple[int, int, int] | None:
+    def _pan_at(raw: str, groups: list[tuple[int, int]], i: int, llvar: bool = True) -> tuple[int, int, int] | None:
         """The longest Luhn-valid 13-19 digit PAN starting at digit group i, as (start, end, next group).
 
         Candidates are whole groups (`4111 1111 1111 1111 12/25` keeps the expiry) or, within one group,
-        the digits behind an ISO 8583 LLVAR length prefix (`DE002=164111111111111111`).
+        the digits behind an ISO 8583 LLVAR length prefix (`DE002=164111111111111111`), unless `llvar` is off.
         """
         for j in range(len(groups), i, -1):
             digits = re.sub(r"\D", "", raw[groups[i][0]:groups[j - 1][1]])
             if 13 <= len(digits) <= 19 and luhn_valid(digits):
                 return groups[i][0], groups[j - 1][1], j
+        if not llvar:
+            return None
         start, end = groups[i]
         n = int(raw[start:start + 2]) if end - start >= 15 else 0
         if 13 <= n <= 19 and end - start >= 2 + n and luhn_valid(raw[start + 2:start + 2 + n]):
